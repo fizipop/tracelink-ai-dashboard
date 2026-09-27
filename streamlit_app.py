@@ -357,7 +357,7 @@ def extract_with_claude(client, report_text):
         max_tokens=3500,
         system=SYSTEM_PROMPT,
         tools=[EXTRACTION_TOOL],
-        tool_choice={"type": "tool", "name": "extract_compliance_data"},
+        tool_choice={"type": "auto"},
         messages=[{"role": "user", "content": report_text}],
     )
     for block in response.content:
