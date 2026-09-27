@@ -164,19 +164,13 @@ def extract_with_claude(client, report_text):
         messages=[{"role": "user", "content": report_text}],
     )
 
-    # Find Claude's tool-use response
     for block in response.content:
         if block.type == "tool_use" and block.name == "extract_compliance_data":
-            return block.input
+            return dict(block.input)
 
-    raise ValueError("Claude did not return the expected extraction tool result.")
-
-    return response
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "extract_compliance_data":
-            return block.input
-    raise RuntimeError("Model did not return a structured extraction — no tool_use block found.")
-
+    raise RuntimeError(
+        "Model did not return a structured extraction — no tool_use block found."
+    )
 
 # ============================================================================
 # DETERMINISTIC EVALUATION (stays in plain Python — not delegated to the model)
@@ -286,8 +280,9 @@ if uploaded is not None:
         st.error(st.session_state["api_error"])
         st.stop()
 
-    extracted = st.session_state["extracted"]
-    result = evaluate(extracted)
+extracted = extract_with_claude(client, report_text)
+st.session_state["extracted"] = extracted
+result = evaluate(extracted)
 
     st.subheader("📋 Data Extracted From the Inspection Report")
     c1, c2 = st.columns(2)
