@@ -1,0 +1,4 @@
+chromadb
+anthropic
+pydantic
+streamlit
