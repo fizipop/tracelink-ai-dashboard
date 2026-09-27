@@ -22,7 +22,7 @@ st.title("🛡️ TraceLink AI Compliance Command Center")
 st.subheader("Automated Industrial Safety & Regulatory Verification Platform")
 st.markdown("---")
 
-# Left Control Column: Settings and Input Files
+# Left Control Column Layout Configuration
 st.sidebar.header("📋 Verification Settings")
 framework_selection = st.sidebar.selectbox(
     "Select Target Regulatory Framework",
@@ -51,36 +51,68 @@ with col2:
     
     if uploaded_file is not None:
         try:
-            # Parse the uploaded file bytes directly into memory (Bypassing network API calls)
+            # Parse the uploaded file bytes directly into memory
             file_contents = uploaded_file.getvalue()
             component_specs = json.loads(file_contents)
             
             rulebook = INDUSTRIAL_STANDARDS[framework_selection]
             audit_failures = []
+            remediation_guidance = []
             
-            # Execute Check 1: Material Evaluation Loop
-            if component_specs.get("material") not in rulebook["allowed_materials"]:
+            # Execute Check 1: Material Evaluation
+            current_material = component_specs.get("material")
+            if current_material not in rulebook["allowed_materials"]:
                 audit_failures.append({
                     "parameter": "Material Analysis",
-                    "error": f"Unauthorized material specification. Approved parameters: {rulebook['allowed_materials']}",
+                    "error": f"Unauthorized material specification: '{current_material}'",
                     "severity": "CRITICAL_STOP"
+                })
+                remediation_guidance.append({
+                    "issue": "Illegal Material Selection",
+                    "action_required": f"Replace '{current_material}' with an approved framework compound.",
+                    "recommended_options": rulebook["allowed_materials"]
                 })
                 
-            # Execute Check 2: Structural Integrity Loop
-            if component_specs.get("calculated_shear_stress_mpa", 0) > rulebook["max_allowable_shear_stress_mpa"]:
+            # Execute Check 2: Structural Integrity Load Check
+            current_stress = component_specs.get("calculated_shear_stress_mpa", 0)
+            max_stress = rulebook["max_allowable_shear_stress_mpa"]
+            if current_stress > max_stress:
+                excess_stress = current_stress - max_stress
                 audit_failures.append({
                     "parameter": "Mechanical Structural Integrity",
-                    "error": f"Stress limit exceeded. Max safety boundary: {rulebook['max_allowable_shear_stress_mpa']} MPa",
+                    "error": f"Stress limit exceeded. Measured: {current_stress} MPa (Limit: {max_stress} MPa)",
                     "severity": "CRITICAL_STOP"
                 })
+                remediation_guidance.append({
+                    "issue": "Structural Overstress Failure",
+                    "action_required": f"Reduce localized load stresses by a minimum of {excess_stress:.1f} MPa.",
+                    "engineering_suggestions": [
+                        "Increase the component's cross-sectional thickness profile.",
+                        "Optimize wall fillet radii to distribute load concentrations evenly.",
+                        "Utilize internal honeycomb structural ribbing networks."
+                    ]
+                })
             
-            # Draw custom UI reporting components based on audit results
+            # Render visual reporting components based on audit results
             if len(audit_failures) == 0:
                 st.success("✅ COMPLIANCE STATUS: VERIFIED SECURE")
                 st.balloons()
             else:
                 st.error(f"❌ COMPLIANCE STATUS: BLOCKED ({len(audit_failures)} CRITICAL DEVIATIONS DETECTED)")
+                
+                # Render the Advanced Intelligent Remediation Guidance Section
+                st.markdown("### 🪛 Automated Engineering Remediation Blueprint:")
+                for step, item in enumerate(remediation_guidance, start=1):
+                    with st.expander(f"Fix Plan #{step}: {item['issue']}", expanded=True):
+                        st.write(f"**Required Correction:** {item['action_required']}")
+                        if "recommended_options" in item:
+                            st.info(f"**Compliant Engineering Alternatives:** {', '.join(item['recommended_options'])}")
+                        if "engineering_suggestions" in item:
+                            st.warning("**Recommended Structural Stress Mitigation Methods:**")
+                            for bullet in item["engineering_suggestions"]:
+                                st.write(f"• {bullet}")
             
+            st.markdown("---")
             st.markdown("### Deep System Audit Parameters Logs:")
             st.json({
                 "status": "FILE_AUDIT_COMPLETE",
