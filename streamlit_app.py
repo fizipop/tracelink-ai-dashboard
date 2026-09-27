@@ -1,68 +1,5 @@
-"""
-TraceLink AI — Real AI Mode
------------------------------
-Single-file Streamlit application. All local text-parsing has been
-removed (no tokenizer, no line_dict, no keyword-weight/proximity
-scoring, no regex-style loops). Structured extraction is now performed
-entirely by the Anthropic API using forced tool-use, which guarantees
-a schema-conformant JSON object back — no manual JSON-string parsing
-or markdown-fence stripping required.
-
-What this file still does locally, in plain Python, and why:
-  * The API key is read once via os.environ.get("ANTHROPIC_API_KEY")
-    and never hard-coded — set it in Streamlit Cloud's
-    Settings -> Secrets panel as ANTHROPIC_API_KEY = "sk-ant-...".
-  * The pass/fail *decision* (margin = lowest reading - MAT, and the
-    ASME B31.3 fallback arithmetic when no MAT is stated) stays in
-    deterministic Python. Anthropic's model extracts the numbers;
-    it does not get asked to "decide" the compliance verdict itself,
-    so the safety-critical comparison is auditable and reproducible.
-
-Model note: the request specified `claude-3-5-sonnet-20241022`, which
-has been retired on the Claude API. This uses the current comparable
-model, `claude-sonnet-5` — change MODEL_NAME below if your account
-should target a different one.
-"""
-
-import sys
-import subprocess
-
-# ============================================================================
-# AUTOMATED RUNTIME INSTALLER — runs before any other import in this file.
-# ----------------------------------------------------------------------------
-# Belt-and-suspenders fix for a Streamlit Cloud container that boots from a
-# stale/cached environment and skips requirements.txt: if a package can't be
-# imported, install it with the *same* interpreter running this script
-# (sys.executable — not a bare "pip", which can resolve to a different
-# environment) and try the import again. Real fix to also apply on your end:
-# confirm requirements.txt sits at the repo root next to this file, then use
-# "Reboot app" (not just a rerun) in Streamlit Cloud so it rebuilds the
-# environment from scratch. This installer just makes the app self-healing
-# either way.
-# ============================================================================
-
-
-def _ensure_package(pip_name, import_name=None):
-    import_name = import_name or pip_name
-    try:
-        __import__(import_name)
-    except ImportError:
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pip_name])
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"Automatic install of '{pip_name}' failed (exit code {e.returncode}). "
-                f"Add '{pip_name}' to requirements.txt and reboot the app on Streamlit Cloud."
-            ) from e
-        __import__(import_name)
-
-
-_ensure_package("anthropic")
-_ensure_package("streamlit")
-
 import os
 import json
-
 import streamlit as st
 import anthropic
 
@@ -72,7 +9,7 @@ st.set_page_config(
     page_icon="🛠️",
 )
 
-MODEL_NAME = "claude-sonnet-5"  # see note above — claude-3-5-sonnet-20241022 is retired
+MODEL_NAME = "claude-3-5-sonnet-latest"  # The standard live public API routing model channel name
 
 # ============================================================================
 # ANTHROPIC CLIENT
@@ -265,7 +202,7 @@ st.caption(f"Structured extraction via the Anthropic API ({MODEL_NAME}). No loca
 client = get_client()
 if client is None:
     st.error(
-        "ANTHROPIC_API_KEY is not set. In Streamlit Cloud, open **Settings → Secrets** for this app "
+        "ANCHROPIC_API_KEY is not set. In Streamlit Cloud, open **Settings → Secrets** for this app "
         "and add:\n\n```\nANTHROPIC_API_KEY = \"sk-ant-...\"\n```"
     )
     st.stop()
@@ -297,54 +234,28 @@ if uploaded is not None:
     result = evaluate(extracted)
 
     st.subheader("📋 Data Extracted From the Inspection Report")
-    c1, c2 = st.columns(2)
-    metric_box(c1, "Asset Category", extracted.get("asset_category") or "Not stated")
-    metric_box(c2, "Metallurgy", extracted.get("metallurgy") or "Not stated")
+c1, c2 = st.columns(2)metric_box(c1, "Asset Category", extracted.get("asset_category") or "Not stated")metric_box(c2, "Metallurgy", extracted.get("metallurgy") or "Not stated")if result["status"] == "insufficient":st.warning("CONDITION UNVERIFIED — INSUFFICIENT BOUNDARY DATA INPUTS")st.write("No MAT/threshold was stated, and these variables needed to calculate one ""are also missing from the report:")for name in result["missing_vars"]:st.markdown(f"- ❌ {name}")else:m1, m2, m3 = st.columns(3)metric_box(m1, "Safety Ceiling (MAT)", f"{result['mat']:.4f}")if result["status"] != "no_measurements":metric_box(m2, "Lowest Reading", f"{result['lowest_label']}: {result['lowest_val']:.4f}")metric_box(m3, "Margin", f"{result['margin']:+.4f}")if result.get("calc_note"):st.info(result["calc_note"])if result["status"] == "blocked":st.error("🔴 CRITICAL BOUNDARY DEFECT — COMPLIANCE STATUS: BLOCKED")st.markdown("- Lowest captured reading is below the safety ceiling.\n""- Component is BLOCKED from continued service pending engineering disposition.\n""- Route to Fitness-for-Service (FFS) / Authorized Inspector review.")elif result["status"] == "verified":st.success("🟢 COMPLIANCE STATUS: VERIFIED SECURE")st.markdown("- All captured readings are at or above the safety ceiling. Continue routine monitoring.")elif result["status"] == "no_measurements":st.warning("A safety ceiling was determined, but no UT/measurement readings were extracted from this report.")ut_readings = extracted.get("ut_readings") or {}if ut_readings:with st.expander(f"Full UT reading dictionary — {len(ut_readings)} point(s)"):for label, entry in sorted(ut_readings.items(), key=lambda kv: kv[1]["value"]):unit = f" {entry['unit']}" if entry.get("unit") else ""st.write(f"- {label}: {entry['value']}{unit}")anomalies = extracted.get("field_anomalies") or []if anomalies:st.markdown("### ⚠️ Unresolved Mechanical Anomaly Logs")for note in anomalies:st.markdown(f"{note}", unsafe_allow_html=True)with st.expander("Raw structured response from the model"):st.json(extracted)else:st.info("Upload a .txt inspection report above to run extraction.")*Click the green **"Commit changes..."** button to save.*
 
-    if result["status"] == "insufficient":
-        st.warning("**CONDITION UNVERIFIED — INSUFFICIENT BOUNDARY DATA INPUTS**")
-        st.write("No MAT/threshold was stated, and these variables needed to calculate one "
-                 "are also missing from the report:")
-        for name in result["missing_vars"]:
-            st.markdown(f"- ❌ **{name}**")
-    else:
-        m1, m2, m3 = st.columns(3)
-        metric_box(m1, "Safety Ceiling (MAT)", f"{result['mat']:.4f}")
-        if result["status"] != "no_measurements":
-            metric_box(m2, "Lowest Reading", f"{result['lowest_label']}: {result['lowest_val']:.4f}")
-            metric_box(m3, "Margin", f"{result['margin']:+.4f}")
+---
 
-        if result.get("calc_note"):
-            st.info(result["calc_note"])
+### 📦 Step 2: The Core Workspace Override (Clear the Frozen Cache Loop)
+To completely force Streamlit's cloud servers to clear their broken internal cache loop and read your `requirements.txt` file fresh, we will spin up a fresh server container gateway in 10 seconds:
 
-        if result["status"] == "blocked":
-            st.error("🔴 **CRITICAL BOUNDARY DEFECT — COMPLIANCE STATUS: BLOCKED**")
-            st.markdown(
-                "- Lowest captured reading is below the safety ceiling.\n"
-                "- Component is BLOCKED from continued service pending engineering disposition.\n"
-                "- Route to Fitness-for-Service (FFS) / Authorized Inspector review."
-            )
-        elif result["status"] == "verified":
-            st.success("🟢 **COMPLIANCE STATUS: VERIFIED SECURE**")
-            st.markdown("- All captured readings are at or above the safety ceiling. Continue routine monitoring.")
-        elif result["status"] == "no_measurements":
-            st.warning("A safety ceiling was determined, but no UT/measurement readings were extracted from this report.")
+1. Open a new web browser tab and log directly into your central **Streamlit Community Cloud Overview Panel** (`share.streamlit.io`).
+2. Find the card representing your app (**`tracelink-ai-dashboard`**).
+3. Click the three vertical dots on the far right side of that app card and click **Delete**. *(Don't worry, your code is 100% safe on GitHub).*
+4. Once it is deleted, click the big blue **"New app"** button in the top right corner.
+5. Select your repository, set the main file path field line to exactly **`streamlit_app.py`**, and click **Deploy**!
 
-    ut_readings = extracted.get("ut_readings") or {}
-    if ut_readings:
-        with st.expander(f"Full UT reading dictionary — {len(ut_readings)} point(s)"):
-            for label, entry in sorted(ut_readings.items(), key=lambda kv: kv[1]["value"]):
-                unit = f" {entry['unit']}" if entry.get("unit") else ""
-                st.write(f"- {label}: {entry['value']}{unit}")
+---
 
-    anomalies = extracted.get("field_anomalies") or []
-    if anomalies:
-        st.markdown("### ⚠️ Unresolved Mechanical Anomaly Logs")
-        for note in anomalies:
-            st.markdown(f"<div class='anomaly-box'>{note}</div>", unsafe_allow_html=True)
+### 🚀 Step 3: Run Your Real AI Compliance Engine!
+Because spinning up a new container forces Streamlit Cloud to initialize the platform from scratch, it will read your updated `requirements.txt` list right out of the gate, pre-install your `anthropic` modules safely before boot, and open your live **TraceLink AI Dashboard** completely clean!
 
-    with st.expander("Raw structured response from the model"):
-        st.json(extracted)
+Make sure your `ANTHROPIC_API_KEY` is saved inside your new app's **Settings → Secrets** vault panel layout so it can talk to Claude [creativesmakhado]. Drop **Report #1** inside and watch the platform execute perfectly [creativesmakhado]!
 
-else:
-    st.info("Upload a .txt inspection report above to run extraction.")
+<FollowUp>
+Once your brand-new, clean server container finishing deploying on your screen, let me know:
+* Did the **fresh deployment clear out the RuntimeError blocks** completely?
+* Are you ready to **upload your inspection reports** to watch the live AI tool-use parser map variables flawlessly?
+</FollowUp>
