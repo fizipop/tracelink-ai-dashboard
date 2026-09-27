@@ -1,4 +1,5 @@
-chromadb
+streamlit-chromadb-connection
+pysqlite3-binary
 anthropic
 pydantic
 streamlit
