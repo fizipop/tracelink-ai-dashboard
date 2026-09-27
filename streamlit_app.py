@@ -507,14 +507,28 @@ EXTRACTION_TOOL = {
 }
 
 
-def extract_with_claude(client, report_text):
-    """Sends the raw text stream straight to the model and forces a tool
-    execution pass, guaranteeing that the SDK hands back the structured data
-    manifest block instead of a plain conversational reply. tool_choice
-    {"type": "auto"} previously left the model free to answer in prose on
-    some inputs, which is exactly the failure mode that raised "no tool_use
-    block found" — {"type": "tool", "name": ...} removes that option
-    entirely: the API will not return a text-only turn while this is set."""
+RETRY_DIRECTIVE = """
+
+IMPORTANT — RETRY DIRECTIVE: On the previous attempt at this exact report, \
+you replied with plain conversational text instead of calling the \
+extract_compliance_data tool. This retry has exactly one acceptable \
+outcome: call extract_compliance_data with whatever you can find in the \
+report. Do not describe the report, do not ask a clarifying question, do \
+not apologize or explain in text — the tool call is the entire response. \
+If the report genuinely contains nothing extractable, still call the tool \
+with every field left null/empty and record why in \
+missing_engineering_variables_ledger — do not fall back to a text reply \
+under any circumstances."""
+
+
+def _request_structured_extraction(client, report_text, system_prompt):
+    """One API call attempt. tool_choice is kept at {"type": "auto"} — this
+    model rejects forced tool selection ({"type": "tool"} / {"type": "any"})
+    with a 400 error, so forcing is not an available lever here. Returns
+    (tool_input, fallback_text): tool_input is the dict of extracted fields
+    if a tool_use block came back, else None; fallback_text is whatever
+    plain text the model wrote instead, for diagnostics only — it is never
+    used as extracted data."""
     response = client.messages.create(
         model=MODEL_NAME,
         # Kept at 6000 (raised from the pre-flattening version's 3500): a
@@ -522,17 +536,50 @@ def extract_with_claude(client, report_text):
         # dense report than several small nested objects did, since there's
         # no per-object JSON scaffolding splitting up the budget anymore.
         max_tokens=6000,
-        system=SYSTEM_PROMPT,
+        system=system_prompt,
         tools=[EXTRACTION_TOOL],
-        # FORCED MANDATE: locks the model into calling extract_compliance_data
-        # — it cannot reply with plain text on this turn.
         tool_choice={"type": "auto"},
         messages=[{"role": "user", "content": report_text}],
     )
+    fallback_text_parts = []
     for block in response.content:
         if block.type == "tool_use" and block.name == "extract_compliance_data":
-            return dict(block.input)
-    raise RuntimeError("Model did not return a structured extraction — no tool_use block found.")
+            return dict(block.input), ""
+        if block.type == "text":
+            fallback_text_parts.append(block.text)
+    return None, "\n".join(fallback_text_parts).strip()
+
+
+def extract_with_claude(client, report_text):
+    """Sends the raw text report to the model and returns the structured
+    extraction dict. tool_choice stays {"type": "auto"} throughout — this
+    model's API rejects a forced tool_choice ({"type": "tool", "name": ...}
+    or {"type": "any"}) with a 400 error, so this function cannot lean on
+    that lever the way an earlier version of this file tried to.
+
+    Instead it makes up to two attempts. If the first call comes back with
+    plain conversational text instead of a tool_use block, it retries once
+    with the same report but a stronger, single-purpose directive appended
+    to the system prompt, explicitly naming what went wrong and ruling out
+    a text reply. If the retry also fails to produce a tool_use block, this
+    raises rather than fabricating a structured extraction from whichever
+    text the model wrote — the calling code in the main script body already
+    treats that exception as a hard stop, not a silent default."""
+    tool_input, fallback_text = _request_structured_extraction(client, report_text, SYSTEM_PROMPT)
+    if tool_input is not None:
+        return tool_input
+
+    tool_input, retry_fallback_text = _request_structured_extraction(
+        client, report_text, SYSTEM_PROMPT + RETRY_DIRECTIVE
+    )
+    if tool_input is not None:
+        return tool_input
+
+    detail = retry_fallback_text or fallback_text or "(model returned no text on either attempt)"
+    raise RuntimeError(
+        "Model did not return a structured extraction after two attempts — no tool_use block found "
+        f"on the initial call or the retry. Last conversational reply from the model: {detail[:500]}"
+    )
 
 # ============================================================================
 # PASS 2 — NATIVE PYTHON DISPOSITION PARSER
