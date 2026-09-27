@@ -508,16 +508,25 @@ EXTRACTION_TOOL = {
 
 
 def extract_with_claude(client, report_text):
+    """Sends the raw text stream straight to the model and forces a tool
+    execution pass, guaranteeing that the SDK hands back the structured data
+    manifest block instead of a plain conversational reply. tool_choice
+    {"type": "auto"} previously left the model free to answer in prose on
+    some inputs, which is exactly the failure mode that raised "no tool_use
+    block found" — {"type": "tool", "name": ...} removes that option
+    entirely: the API will not return a text-only turn while this is set."""
     response = client.messages.create(
         model=MODEL_NAME,
-        # Raised from the prior version's 3500: a single flat string field can
-        # legitimately need more room on a dense report than several small
-        # nested objects did, since there's no longer per-object JSON
-        # scaffolding splitting up the budget.
+        # Kept at 6000 (raised from the pre-flattening version's 3500): a
+        # single flat string field can legitimately need more room on a
+        # dense report than several small nested objects did, since there's
+        # no per-object JSON scaffolding splitting up the budget anymore.
         max_tokens=6000,
         system=SYSTEM_PROMPT,
         tools=[EXTRACTION_TOOL],
-        tool_choice={"type": "auto"},
+        # FORCED MANDATE: locks the model into calling extract_compliance_data
+        # — it cannot reply with plain text on this turn.
+        tool_choice={"type": "tool", "name": "extract_compliance_data"},
         messages=[{"role": "user", "content": report_text}],
     )
     for block in response.content:
