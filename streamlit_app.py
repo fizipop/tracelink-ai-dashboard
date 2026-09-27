@@ -247,7 +247,7 @@ def metric_box(col, label, value):
 
 
 st.title("🛠️ TraceLink AI — Real AI Mode")
-st.caption(f"Structured extraction via the Anthropic API ({}). No local parsing logic.")
+st.caption(f"Structured extraction via the Anthropic API ({MODEL}). No local parsing logic.")
 
 client = get_client()
 if client is None:
