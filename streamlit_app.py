@@ -155,17 +155,16 @@ EXTRACTION_TOOL = {
 
 
 def extract_with_claude(client, report_text):
-    """Send the raw report straight to the model and force a tool call, so
-    the SDK hands back an already-parsed Python dict — no JSON.loads /
-    fence-stripping needed on our side."""
+    """Send the report to Claude and let it use the extraction tool."""
     response = client.messages.create(
         model=MODEL_NAME,
         max_tokens=2000,
         system=SYSTEM_PROMPT,
         tools=[EXTRACTION_TOOL],
-        tool_choice={"type": "tool", "name": "extract_compliance_data"},
         messages=[{"role": "user", "content": report_text}],
     )
+
+    return response
     for block in response.content:
         if block.type == "tool_use" and block.name == "extract_compliance_data":
             return block.input
