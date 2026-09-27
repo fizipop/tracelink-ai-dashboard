@@ -280,9 +280,9 @@ if uploaded is not None:
         st.error(st.session_state["api_error"])
         st.stop()
 
-extracted = extract_with_claude(client, report_text)
-st.session_state["extracted"] = extracted
-result = evaluate(extracted)
+    extracted = extract_with_claude(client, report_text)
+    st.session_state["extracted"] = extracted
+    result = evaluate(extracted)
 
     st.subheader("📋 Data Extracted From the Inspection Report")
     c1, c2 = st.columns(2)
