@@ -26,27 +26,22 @@ What stays in plain, deterministic Python, and why:
     review flags, not treated as ground truth.
 
 Model note: MODEL_NAME stays "claude-opus-5-5" — this document again
-requested "claude-3-5-sonnet-latest", which is retired on the Claude
+asked for "claude-3-5-sonnet-latest", which is retired on the Claude
 API, and your earlier instruction was explicitly to keep
 claude-opus-5-5, so that override still stands. Say so if you want it
 changed.
 
-Two UI notes worth flagging, since both rely on techniques outside
-Streamlit's official surface:
-  * The centered "fixit" wordmark is a real <canvas> particle system
-    (its own component iframe): the glyphs are sampled into a dense
-    particle field that springs to its home position and shatters into
-    fine, swirling grains under the cursor, then eases back on
-    mouse-leave. The "backup safe route" from the spec is implemented
-    as an always-on CSS glow on the logo's wrapper (not real-time FPS
-    detection, which isn't something a self-contained script can
-    reliably do) — so even if JavaScript/canvas is unavailable, the
-    wrapper still gets a warm amber glow on hover, and the static glass
-    text underneath stays fully legible either way.
-  * The cursor-following glow on result cards reaches from a component
-    iframe into `window.parent.document`, which works because the
-    iframe is same-origin today but isn't an official API — wrapped in
-    try/except so it fails silently rather than breaking the app.
+Title note: the "fixit" wordmark below is now pure CSS — no <canvas>,
+no JS, no particle/dot tracking of any kind. The glass fill is a
+translucent color + text-stroke; the hover sheen sweep is a second
+copy of the same text (via a `::before` pseudo-element using
+`content: attr(data-text)`) clipped to a gradient that slides across
+on hover, which is the standard CSS trick for a "shimmer" effect
+without touching the DOM or drawing pixels. The one remaining bit of
+JS in this file is the cursor-following glow on the result cards
+lower down, which is unrelated to the logo and untouched by this
+rewrite; it's wrapped in try/except and degrades silently if
+unavailable.
 """
 
 import sys
@@ -69,6 +64,145 @@ st.set_page_config(
     page_title="fixit",
     layout="wide",
     page_icon="🛠️",
+)
+
+# ============================================================================
+# GLOBAL STYLE SHEET + CENTER-TOP GLASS TITLE (pure CSS, no canvas/JS)
+# ============================================================================
+
+st.markdown(
+    """
+    <style>
+    html, body, [data-testid="stAppViewContainer"] {
+        background:
+            radial-gradient(circle at 15% 20%, rgba(54,15,37,0.55), transparent 45%),
+            radial-gradient(circle at 85% 15%, rgba(31,20,53,0.6), transparent 50%),
+            radial-gradient(circle at 50% 90%, rgba(31,20,53,0.35), transparent 55%),
+            #0A0E1A;
+        background-attachment: fixed;
+    }
+
+    .glass-title-container {
+        margin: 0 auto;
+        text-align: center;
+        display: block;
+        width: 100%;
+        padding-top: 1.5rem;
+        padding-bottom: 2rem;
+    }
+    .glass-title {
+        position: relative;
+        display: inline-block;
+        font-size: 5rem;
+        font-weight: 800;
+        font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+        letter-spacing: -0.02em;
+        color: rgba(255, 255, 255, 0.12);
+        -webkit-text-stroke: 1px rgba(255, 255, 255, 0.28);
+        backdrop-filter: blur(12px);
+        -webkit-backdrop-filter: blur(12px);
+        text-shadow: 0 4px 15px rgba(0, 0, 0, 0.4), inset 0 1px 1px rgba(255, 255, 255, 0.3);
+        border-top: 1px solid rgba(255, 255, 255, 0.15);
+        margin: 0;
+        transition: transform 0.5s cubic-bezier(0.16, 1, 0.3, 1), text-shadow 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    /* Sheen-sweep layer: a second copy of the letters, clipped to a gradient
+       that slides from off-screen-left to off-screen-right on hover. No
+       canvas, no per-pixel anything — just a clipped background on text. */
+    .glass-title::before {
+        content: attr(data-text);
+        position: absolute;
+        left: 0; top: 0; width: 100%; height: 100%;
+        background: linear-gradient(120deg, transparent 35%, rgba(255,255,255,0.9) 50%, transparent 65%);
+        background-size: 250% 100%;
+        background-position: -250% 0;
+        -webkit-background-clip: text;
+        background-clip: text;
+        color: transparent;
+        -webkit-text-stroke: 1px transparent;
+        pointer-events: none;
+        transition: background-position 1.1s ease;
+    }
+    .glass-title-container:hover .glass-title {
+        transform: scale(1.03);
+        text-shadow: 0 0 35px rgba(251, 191, 36, 0.35);
+    }
+    .glass-title-container:hover .glass-title::before {
+        background-position: 250% 0;
+    }
+
+    .glass-card {
+        background: rgba(255, 255, 255, 0.03);
+        backdrop-filter: blur(25px) saturate(180%);
+        -webkit-backdrop-filter: blur(25px) saturate(180%);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 16px;
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+        padding: 14px 18px;
+        margin-bottom: 12px;
+        transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+        background-repeat: no-repeat;
+    }
+    .glass-card:hover {
+        transform: translateY(-4px);
+        border-color: rgba(0, 242, 254, 0.45);
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37), 0 0 26px rgba(0, 242, 254, 0.18);
+    }
+    .metric-label { color: #9CA3AF; font-size: 0.72rem; text-transform: uppercase; letter-spacing: .05em; }
+    .metric-value { color: #F9FAFB; font-size: 1.2rem; font-weight: 700; word-wrap: break-word; }
+    .accent-cyan { color: #00F2FE; }
+    .accent-gold { color: #FBBF24; }
+
+    .component-card.blocked {
+        background: rgba(69, 10, 10, 0.45) !important;
+        border: 1px solid #EF4444 !important;
+        box-shadow: 0 0 30px rgba(239, 68, 68, 0.2) !important;
+    }
+    .component-card.verified { border-color: rgba(22,163,74,0.5); }
+    .component-card.unresolved { border-color: rgba(107,114,128,0.5); }
+    /* Aero-glow status light: pulses on hover, matching pass/fail disposition. */
+    .component-card.verified:hover {
+        animation: breathe-emerald-hover 1.4s ease-in-out infinite;
+        border-color: rgba(16,185,129,0.6);
+    }
+    .component-card.blocked:hover {
+        animation: breathe-crimson-hover 1.2s ease-in-out infinite;
+    }
+    @keyframes breathe-emerald-hover {
+        0%, 100% { box-shadow: 0 0 20px rgba(16,185,129,0.25); }
+        50% { box-shadow: 0 0 40px rgba(16,185,129,0.45); }
+    }
+    @keyframes breathe-crimson-hover {
+        0%, 100% { box-shadow: 0 0 20px rgba(239,68,68,0.3); }
+        50% { box-shadow: 0 0 45px rgba(239,68,68,0.55); }
+    }
+
+    .status-pill {
+        display:inline-block; padding:2px 10px; border-radius:999px; font-size:0.7rem;
+        font-weight:700; letter-spacing:.03em; text-transform:uppercase; margin-left:8px;
+    }
+    .status-pill.blocked { background:#DC2626; color:#FEF2F2; }
+    .status-pill.verified { background:#16A34A; color:#F0FDF4; }
+    .status-pill.unresolved { background:#6B7280; color:#F9FAFB; }
+    [data-testid="stExpander"] {
+        border: 1px solid rgba(255,255,255,0.12) !important;
+        border-radius: 16px !important;
+        background: rgba(255, 255, 255, 0.03) !important;
+        backdrop-filter: blur(25px) saturate(180%) !important;
+    }
+    .raw-terminal {
+        background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.12); border-radius: 16px;
+        padding: 14px; color: #9CA3AF; font-family: monospace; font-size: 0.8rem;
+        max-height: 640px; overflow-y: auto; white-space: pre-wrap;
+        backdrop-filter: blur(25px) saturate(180%);
+    }
+    </style>
+
+    <div class="glass-title-container">
+        <h1 class="glass-title" data-text="fixit">fixit</h1>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 MODEL_NAME = "claude-opus-5-5"  # see docstring note — claude-3-5-sonnet-latest is retired
@@ -223,7 +357,7 @@ def extract_with_claude(client, report_text):
         max_tokens=3500,
         system=SYSTEM_PROMPT,
         tools=[EXTRACTION_TOOL],
-        tool_choice={"type": "auto"},
+        tool_choice={"type": "tool", "name": "extract_compliance_data"},
         messages=[{"role": "user", "content": report_text}],
     )
     for block in response.content:
@@ -262,7 +396,7 @@ def calc_b31_3_mat(piping_vars):
 
 def evaluate_component(component, is_piping, piping_vars):
     """is_piping gates the B31.3 fallback so it never fires for structural steel
-    or other non-pressurized assets — requirement #4."""
+    or other non-pressurized assets."""
     name = component.get("component_name") or "Unnamed Component"
     ut_list = component.get("ut_thickness_measurements") or []
     mat_field = component.get("explicit_minimum_required_mat")
@@ -379,81 +513,9 @@ def audit_extraction(report_text, extracted):
     return notices
 
 # ============================================================================
-# FROSTED-GLASS / MESH-GRADIENT UI
+# CURSOR-FOLLOWING GLOW ON RESULT CARDS (best-effort; unrelated to the title)
 # ============================================================================
 
-st.markdown(
-    """
-    <style>
-    html, body, [data-testid="stAppViewContainer"] {
-        background:
-            radial-gradient(circle at 15% 20%, rgba(60,17,44,0.55), transparent 45%),
-            radial-gradient(circle at 85% 15%, rgba(35,21,60,0.6), transparent 50%),
-            radial-gradient(circle at 50% 90%, rgba(20,60,58,0.35), transparent 55%),
-            #0A0E1A;
-        background-attachment: fixed;
-    }
-    .glass-card {
-        background: rgba(255, 255, 255, 0.03);
-        backdrop-filter: blur(25px) saturate(180%);
-        -webkit-backdrop-filter: blur(25px) saturate(180%);
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        border-radius: 16px;
-        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
-        padding: 14px 18px;
-        margin-bottom: 12px;
-        transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-        background-repeat: no-repeat;
-    }
-    .glass-card:hover {
-        transform: translateY(-4px);
-        border-color: rgba(0, 242, 254, 0.45);
-        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37), 0 0 26px rgba(0, 242, 254, 0.18);
-    }
-    .metric-label { color: #9CA3AF; font-size: 0.72rem; text-transform: uppercase; letter-spacing: .05em; }
-    .metric-value { color: #F9FAFB; font-size: 1.2rem; font-weight: 700; word-wrap: break-word; }
-    .accent-cyan { color: #00F2FE; }
-    .accent-gold { color: #FBBF24; }
-    .component-card.blocked {
-        background: rgba(69, 10, 10, 0.45) !important;
-        border: 1px solid #EF4444 !important;
-        box-shadow: 0 0 30px rgba(239, 68, 68, 0.2) !important;
-    }
-    .component-card.verified { border-color: rgba(22,163,74,0.5); }
-    .component-card.unresolved { border-color: rgba(107,114,128,0.5); }
-    .status-pill {
-        display:inline-block; padding:2px 10px; border-radius:999px; font-size:0.7rem;
-        font-weight:700; letter-spacing:.03em; text-transform:uppercase; margin-left:8px;
-    }
-    .status-pill.blocked { background:#DC2626; color:#FEF2F2; }
-    .status-pill.verified { background:#16A34A; color:#F0FDF4; }
-    .status-pill.unresolved { background:#6B7280; color:#F9FAFB; }
-    [data-testid="stExpander"] {
-        border: 1px solid rgba(255,255,255,0.12) !important;
-        border-radius: 16px !important;
-        background: rgba(255, 255, 255, 0.03) !important;
-        backdrop-filter: blur(25px) saturate(180%) !important;
-    }
-    .raw-terminal {
-        background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.12); border-radius: 16px;
-        padding: 14px; color: #9CA3AF; font-family: monospace; font-size: 0.8rem;
-        max-height: 640px; overflow-y: auto; white-space: pre-wrap;
-        backdrop-filter: blur(25px) saturate(180%);
-    }
-    .fixit-logo-wrap {
-        display: block; margin: 0 auto; text-align: center; padding-bottom: 2rem;
-        transition: all 0.7s cubic-bezier(0.16, 1, 0.3, 1);
-        border-radius: 24px;
-    }
-    .fixit-logo-wrap:hover {
-        box-shadow: 0 0 35px rgba(251, 191, 36, 0.35);
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# --- Cursor-following glow on .glass-card elements (best-effort; see docstring) ---
 components.html(
     """
     <script>
@@ -483,84 +545,6 @@ components.html(
     """,
     height=0,
 )
-
-
-def render_fixit_title():
-    """Centered 3D glass wordmark. CSS-only amber glow on the wrapper always
-    works on hover (the spec's 'backup safe route'); the canvas particle
-    shatter layers on top of that whenever JS/canvas is available."""
-    st.markdown("<div class='fixit-logo-wrap'>", unsafe_allow_html=True)
-    components.html(
-        """
-        <div style="width:100%;display:flex;justify-content:center;">
-        <canvas id="fixitCanvas" width="520" height="150" style="background:transparent;"></canvas>
-        </div>
-        <script>
-        (function () {
-            const canvas = document.getElementById('fixitCanvas');
-            const ctx = canvas.getContext('2d');
-            const off = document.createElement('canvas');
-            off.width = canvas.width; off.height = canvas.height;
-            const octx = off.getContext('2d');
-            octx.fillStyle = 'rgba(255,255,255,0.55)';
-            octx.font = "800 4.5rem 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif";
-            octx.textBaseline = 'middle';
-            octx.textAlign = 'center';
-            octx.fillText('fixit', off.width / 2, off.height / 2 + 8);
-            const img = octx.getImageData(0, 0, off.width, off.height).data;
-
-            const particles = [];
-            const step = 2;  // dense, fine grain rather than clumpy dots
-            for (let y = 0; y < off.height; y += step) {
-                for (let x = 0; x < off.width; x += step) {
-                    const idx = (y * off.width + x) * 4;
-                    if (img[idx + 3] > 60) {
-                        particles.push({ hx: x, hy: y, x: x, y: y, vx: 0, vy: 0 });
-                    }
-                }
-            }
-
-            let mouseX = -9999, mouseY = -9999;
-            canvas.addEventListener('mousemove', function (e) {
-                const rect = canvas.getBoundingClientRect();
-                mouseX = e.clientX - rect.left;
-                mouseY = e.clientY - rect.top;
-            });
-            canvas.addEventListener('mouseleave', function () {
-                mouseX = -9999; mouseY = -9999;
-            });
-
-            function frame() {
-                ctx.clearRect(0, 0, canvas.width, canvas.height);
-                for (let i = 0; i < particles.length; i++) {
-                    const p = particles[i];
-                    const dx = p.x - mouseX, dy = p.y - mouseY;
-                    const dist = Math.sqrt(dx * dx + dy * dy) || 0.001;
-                    const radius = 60;
-                    if (dist < radius) {
-                        const force = (radius - dist) / radius;
-                        const angle = Math.atan2(dy, dx) + Math.PI / 2;
-                        p.vx += Math.cos(angle) * force * 2.4 + (dx / dist) * force * 1.5;
-                        p.vy += Math.sin(angle) * force * 2.4 + (dy / dist) * force * 1.5;
-                    }
-                    p.vx += (p.hx - p.x) * 0.10;
-                    p.vy += (p.hy - p.y) * 0.10;
-                    p.vx *= 0.80;
-                    p.vy *= 0.80;
-                    p.x += p.vx;
-                    p.y += p.vy;
-                    ctx.fillStyle = 'rgba(255,255,255,0.55)';
-                    ctx.fillRect(p.x, p.y, 1.4, 1.4);
-                }
-                requestAnimationFrame(frame);
-            }
-            frame();
-        })();
-        </script>
-        """,
-        height=160,
-    )
-    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def metric_html(label, value, accent=None):
@@ -607,8 +591,6 @@ def render_component_card(result):
 
     st.markdown("</div>", unsafe_allow_html=True)
 
-
-render_fixit_title()
 
 client = get_client()
 if client is None:
