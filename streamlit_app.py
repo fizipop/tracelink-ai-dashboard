@@ -483,13 +483,19 @@ Read the raw inspection text the user provides and call the \
   that appear in a data table. Each entry needs a unique event_id you assign \
   (e.g. "PE-01"), the peak/observed pressure, the stated design pressure \
   threshold, timestamp_or_context (whatever time/context marker the text \
-  gives, e.g. "09:42 startup upset"), is_duplicate_or_continuation (true if \
-  this entry is the same physical event as an earlier one just mentioned \
-  again elsewhere in the text, e.g. re-stated in a summary paragraph), and \
-  related_event_ids (the event_id(s) it duplicates or continues, if any). \
-  Do NOT compute variance yourself — that arithmetic is done afterward in \
-  plain Python from the two pressure values you provide. Only include an \
-  event if both the observed and design pressure are explicitly stated.
+  gives, e.g. "09:42 startup upset"), duration_minutes (how long the \
+  excursion was sustained, in minutes, only if the text states or clearly \
+  implies one — e.g. a start/end time pair, or an explicit "for N min"; \
+  leave null if no duration is stated or determinable — never guess or \
+  infer a duration from context alone), is_duplicate_or_continuation (true \
+  if this entry is the same physical event as an earlier one just \
+  mentioned again elsewhere in the text, e.g. re-stated in a summary \
+  paragraph), and related_event_ids (the event_id(s) it duplicates or \
+  continues, if any). Do NOT compute variance yourself, and do NOT decide \
+  yourself whether an event "qualifies" as an excursion — the pressure-AND \
+  -duration qualification gate is applied afterward in plain Python from \
+  the values you provide. Only include an event if both the observed and \
+  design pressure are explicitly stated.
 - Preserve stated uncertainty rather than resolving it. A "possible" or \
   "suspected" weld indication must be recorded in field_anomalies with \
   risk_category "REQUIRES_VERIFICATION" and notes describing it as needing \
@@ -582,6 +588,15 @@ EXTRACTION_TOOL = {
                         "event_id": {"type": "string"},
                         "peak_pressure_psi": {"type": ["number", "null"]},
                         "design_pressure_psi": {"type": ["number", "null"]},
+                        "duration_minutes": {
+                            "type": ["number", "null"],
+                            "description": (
+                                "How long the excursion was sustained, in minutes, only if the text "
+                                "explicitly states or clearly implies a duration (e.g. a start/end "
+                                "timestamp pair, 'for 20 min'). Null if not stated — an event with no "
+                                "stated duration is never assumed to be either brief or sustained."
+                            ),
+                        },
                         "unit": {"type": ["string", "null"]},
                         "timestamp_or_context": {"type": ["string", "null"]},
                         "is_duplicate_or_continuation": {"type": "boolean"},
@@ -926,6 +941,181 @@ def native_parameter_matrix_parser(manifest_text, raw_report):
 
     return components_out, notices
 
+
+# ============================================================================
+# AUTOMATIC FALLBACK / REPARSE ENGINE
+# ============================================================================
+# Runs only when the primary path (model flat_manifest_block ->
+# native_parameter_matrix_parser above) comes back with zero mapped
+# components despite text_extraction_confidence == HIGH and the raw report
+# plainly containing table-like structure — i.e. exactly the "high
+# confidence, zero components mapped" failure mode this stage exists to
+# recover from, rather than a genuine "nothing extractable" report. It never
+# calls the model again: it is a second, independent, deterministic reading
+# of the SAME raw text the primary path already had, so a truncated or
+# malformed flat_manifest_block degrades to a lower-confidence recovery
+# instead of an empty CONDITION UNVERIFIED result.
+
+def raw_text_has_components_or_tables(raw_report):
+    """Cheap heuristic gate for whether the fallback engine is worth trying
+    at all. Intentionally permissive — a false positive just means the
+    fallback engine runs and itself finds nothing to recover (harmless);
+    it exists only to skip the fallback pass entirely on a report that
+    plainly has no structured data (e.g. a single paragraph of prose), so
+    that case is still allowed to resolve as a genuine CONDITION UNVERIFIED
+    rather than being retried pointlessly."""
+    if not raw_report or not raw_report.strip():
+        return False
+    pipe_rows = [ln for ln in raw_report.splitlines() if ln.count("|") >= 2]
+    if len(pipe_rows) >= 2:
+        return True
+    location_like = re.findall(r"\b[A-Z]{1,3}-?\d{1,3}\b", raw_report)
+    decimal_like = re.findall(r"\b\d+\.\d+\b", raw_report)
+    return len(set(location_like)) >= 3 and len(decimal_like) >= 3
+
+
+_FALLBACK_MIN_HEADER_HINTS = ("min", "tmin", "required", "criterion", "limit")
+_FALLBACK_HISTORICAL_HEADER_HINTS = ("previous", "prior", "historical", "baseline", "last", "2024")
+_FALLBACK_SKIP_HEADER_HINTS = ("note", "notes", "comment", "remark", "confidence", "status", "visual")
+
+
+def _split_pipe_row(line):
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _is_separator_row(cells):
+    return bool(cells) and all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c)
+
+
+def _fallback_numbers_from(col_indices, cells, header_cells):
+    """Pulls every decimal/integer token out of each named column, labeling
+    each with its column header (plus a numbered suffix if a single cell
+    contains more than one number, e.g. 'Initial 10.9 / Repeat 11.0')."""
+    out = []
+    for i in col_indices:
+        if i >= len(cells):
+            continue
+        tokens = re.findall(r"-?\d+\.?\d*", cells[i])
+        base_label = header_cells[i].strip() if i < len(header_cells) and header_cells[i].strip() else f"col{i}"
+        for j, tok in enumerate(tokens):
+            val = _coerce_float(tok)
+            if val is None:
+                continue
+            label = base_label if len(tokens) == 1 else f"{base_label}_{j + 1}"
+            out.append({"location_label": label, "value": val, "unit": None})
+    return out
+
+
+def execute_fallback_reparse(raw_report):
+    """Secondary, plain-Python recovery parser. Scans the raw report's own
+    Markdown-style pipe tables directly — using each table's own header row
+    to decide which column is a location/component label, which columns are
+    current-cycle readings, which (if any) are prior-inspection readings,
+    and which (if any) states an explicit minimum — and rebuilds component
+    dicts in the same shape evaluate_component() expects.
+
+    This is a best-effort recovery path, not a replacement for the primary
+    extraction: every component it returns is tagged fallback_extracted=True,
+    which downstream evaluation treats conservatively (a failing margin
+    still BLOCKS; a passing margin is routed to NEEDS_HUMAN_REVIEW rather
+    than confidently CLEARED — see build_evaluation_summary's via_fallback
+    handling) rather than as a definitive pass/fail.
+
+    Returns (components: list[dict], notices: list[str])."""
+    components = []
+    notices = []
+
+    blocks, current = [], []
+    for line in raw_report.splitlines():
+        if line.count("|") >= 2:
+            current.append(line)
+        else:
+            if len(current) >= 2:
+                blocks.append(current)
+            current = []
+    if len(current) >= 2:
+        blocks.append(current)
+
+    if not blocks:
+        notices.append(
+            "Automatic fallback reparse engine ran but found no Markdown-style table structure to "
+            "recover components from."
+        )
+        return components, notices
+
+    for block in blocks:
+        header_cells = _split_pipe_row(block[0])
+        data_rows = [r for r in block[1:] if not _is_separator_row(_split_pipe_row(r))]
+        if not header_cells or not data_rows:
+            continue
+
+        header_lower = [h.lower() for h in header_cells]
+        label_col = 0  # first column is the component/location label by convention
+        min_cols, hist_cols, reading_cols = [], [], []
+        for idx, h in enumerate(header_lower):
+            if idx == label_col:
+                continue
+            if any(hint in h for hint in _FALLBACK_SKIP_HEADER_HINTS):
+                continue
+            if any(hint in h for hint in _FALLBACK_MIN_HEADER_HINTS):
+                min_cols.append(idx)
+            elif any(hint in h for hint in _FALLBACK_HISTORICAL_HEADER_HINTS):
+                hist_cols.append(idx)
+            else:
+                reading_cols.append(idx)
+
+        for row in data_rows:
+            cells = _split_pipe_row(row)
+            if len(cells) <= label_col or not cells[label_col]:
+                continue
+            component_name = cells[label_col].strip("*` ")
+            if not component_name:
+                continue
+
+            ut_readings = _fallback_numbers_from(reading_cols, cells, header_cells)
+            historical_readings = _fallback_numbers_from(hist_cols, cells, header_cells)
+            mat_values = _fallback_numbers_from(min_cols, cells, header_cells)
+
+            if not ut_readings and not historical_readings and not mat_values:
+                continue  # this row carried no recoverable numeric data at all
+
+            components.append({
+                "component_name": component_name,
+                "explicit_minimum_required_mat": (
+                    {"value": mat_values[0]["value"], "unit": None} if mat_values else None
+                ),
+                "mat_provenance": None,
+                "ut_provenance": {
+                    "authority_tier": "Supplemental UT Measurement",
+                    "source": None,
+                    "source_date": None,
+                    "all_values_in_region": [],
+                    "reason": (
+                        "Recovered by the automatic fallback reparse engine directly from a raw "
+                        "table structure after the primary extraction mapped zero components — "
+                        "treat as lower-confidence pending verification."
+                    ),
+                },
+                "ut_thickness_measurements": ut_readings,
+                "historical_ut_thickness_measurements": historical_readings,
+                "fallback_extracted": True,
+            })
+
+    if components:
+        notices.append(
+            f"Automatic fallback reparse engine recovered {len(components)} component(s) directly "
+            "from raw table structure after the primary extraction mapped zero components. These "
+            "readings are tagged as lower-confidence and routed to human review rather than treated "
+            "as a definitive pass, even where the computed margin is positive."
+        )
+    else:
+        notices.append(
+            "Automatic fallback reparse engine found table structure in the raw report but could not "
+            "confidently recover any component rows from it."
+        )
+    return components, notices
+
+
 # ============================================================================
 # DETERMINISTIC EVALUATION
 # ============================================================================
@@ -979,32 +1169,62 @@ def compute_degradation(component):
     }
 
 
-def build_evaluation_summary(status, name, lowest=None, mat=None, mat_unit=None, margin=None):
+def build_evaluation_summary(status, name, lowest=None, mat=None, mat_unit=None, margin=None, via_fallback=False):
     """Decouples the mathematical calculation result from the system's
     workflow status, per the requirement that a workflow label (BLOCKED,
     etc.) must never be presented as if it were itself an engineering
     determination. Both fields, and the explanation joining them, are built
     here in plain Python from numbers already computed elsewhere — never
-    asked of the model."""
+    asked of the model.
+
+    via_fallback marks a component whose readings were recovered by the
+    automatic fallback reparse engine (see execute_fallback_reparse) rather
+    than the primary structured extraction. Per the low/medium-confidence
+    handling rule, such a reading is never treated as a definitive pass: a
+    BLOCKED result stays BLOCKED (a fail is never softened just because the
+    read was a recovery parse), but a passing result is downgraded to
+    NEEDS_HUMAN_REVIEW rather than confidently CLEARED, since a false
+    "pass" from an unverified recovery parse is the more dangerous failure
+    mode to risk."""
     if status == "blocked":
         calculation_result = "BELOW_PROVIDED_MINIMUM"
         workflow_status = "BLOCKED"
         unit = f" {mat_unit}" if mat_unit else ""
+        fallback_note = (
+            " This reading was recovered by the automatic fallback reparse engine, not the "
+            "primary extraction — the BLOCKED status is retained regardless, since a confirmed "
+            "exceedance is never softened on the strength of a lower-confidence read."
+        ) if via_fallback else ""
         status_explanation = (
             f"Mathematical result is BELOW_PROVIDED_MINIMUM ({name} measured {lowest['value']:.4f}{unit} "
             f"vs. {mat:.4f}{unit} required minimum, margin {margin:+.4f}). System workflow set to BLOCKED "
             f"per safety policy — this is a workflow decision, not itself an engineering disposition."
+            f"{fallback_note}"
         )
         risk_category = "FAIL_BELOW_CRITERION"
     elif status == "verified":
-        calculation_result = "WITHIN_SPEC"
-        workflow_status = "CLEARED"
         unit = f" {mat_unit}" if mat_unit else ""
-        status_explanation = (
-            f"Mathematical result is WITHIN_SPEC ({name} measured {lowest['value']:.4f}{unit} vs. "
-            f"{mat:.4f}{unit} required minimum, margin {margin:+.4f}). System workflow set to CLEARED."
-        )
-        risk_category = None
+        if via_fallback:
+            # A passing margin recovered only via the fallback reparse engine is not treated as
+            # a definitive pass — route it to human review instead of confidently clearing it.
+            calculation_result = "WITHIN_SPEC_UNCONFIRMED"
+            workflow_status = "NEEDS_HUMAN_REVIEW"
+            status_explanation = (
+                f"Mathematical result is WITHIN_SPEC ({name} measured {lowest['value']:.4f}{unit} vs. "
+                f"{mat:.4f}{unit} required minimum, margin {margin:+.4f}), but this reading came from "
+                f"the automatic fallback reparse engine rather than the primary extraction. System "
+                f"workflow set to NEEDS_HUMAN_REVIEW rather than CLEARED — a passing margin from a "
+                f"lower-confidence recovery parse is not treated as a definitive pass."
+            )
+            risk_category = "REQUIRES_VERIFICATION"
+        else:
+            calculation_result = "WITHIN_SPEC"
+            workflow_status = "CLEARED"
+            status_explanation = (
+                f"Mathematical result is WITHIN_SPEC ({name} measured {lowest['value']:.4f}{unit} vs. "
+                f"{mat:.4f}{unit} required minimum, margin {margin:+.4f}). System workflow set to CLEARED."
+            )
+            risk_category = None
     else:  # insufficient / no_measurements / no_criteria_no_measurements
         calculation_result = "INSUFFICIENT_DATA"
         workflow_status = "NEEDS_HUMAN_REVIEW"
@@ -1065,25 +1285,45 @@ def evaluate_component(component, is_piping, piping_vars):
     lowest = min(ut_list, key=lambda r: r["value"])
     margin = round(lowest["value"] - mat, 4)
     status = "blocked" if margin < 0 else "verified"
-    evaluation_summary = build_evaluation_summary(status, name, lowest=lowest, mat=mat, mat_unit=mat_unit, margin=margin)
+    via_fallback = bool(component.get("fallback_extracted"))
+    evaluation_summary = build_evaluation_summary(status, name, lowest=lowest, mat=mat, mat_unit=mat_unit,
+                                                     margin=margin, via_fallback=via_fallback)
     return {"name": name, "status": status, "mat": mat, "mat_unit": mat_unit, "lowest": lowest,
              "margin": margin, "calc_note": calc_note, "mat_provenance": mat_provenance,
-             "ut_provenance": ut_provenance, "degradation": degradation,
+             "ut_provenance": ut_provenance, "degradation": degradation, "via_fallback": via_fallback,
              "evaluation_summary": evaluation_summary, "raw": component}
 
 
+MIN_QUALIFYING_EXCURSION_MINUTES = 15  # sustained-duration threshold; see evaluate_pressure_events
+
+
 def evaluate_pressure_events(pressure_events):
-    """Plain-Python variance calc for every logged overpressure excursion.
-    The model supplies event_id/peak/design/timestamp/duplicate-flag only —
-    variance_abs and variance_pct are always computed here, never trusted
-    from the model, per this file's standing rule that safety-relevant
-    arithmetic is never asked of the LLM. Returns a list of dicts, one per
-    event that actually exceeds its design threshold (an event that comes in
-    at or under threshold is dropped — it isn't an excursion). Entries
-    flagged by the model as a duplicate/continuation of an earlier event are
-    kept in the list (so nothing vanishes from the record) but marked
-    is_duplicate so the UI can render one banner instead of two for the same
-    physical event."""
+    """Plain-Python qualification + variance calc for every logged pressure
+    reading. The model supplies event_id/peak/design/duration/timestamp/
+    duplicate-flag only — every comparison below (exceeds-design,
+    meets-duration, and the resulting qualifies-as-excursion determination)
+    is computed here, never trusted from the model, per this file's standing
+    rule that safety-relevant arithmetic and thresholding is never asked of
+    the LLM.
+
+    An event "qualifies" as a confirmed overpressure excursion only when
+    BOTH hold: observed pressure strictly exceeds the stated design
+    pressure, AND the stated duration meets/exceeds
+    MIN_QUALIFYING_EXCURSION_MINUTES. A pressure exceedance with no stated
+    duration is never assumed to be either brief or sustained — it is kept
+    in the returned list (nothing is silently dropped) but marked
+    qualifies=False and duration_status="UNKNOWN" so the UI can route it to
+    REQUIRES_VERIFICATION rather than either clearing it or treating it as a
+    confirmed excursion on pressure alone. An exceedance whose stated
+    duration falls short of the threshold is marked qualifies=False and
+    duration_status="BELOW_THRESHOLD" — it is a real logged exceedance, just
+    not one that meets this app's sustained-excursion bar.
+
+    Non-exceedances (observed <= design) are dropped entirely, as before —
+    they were never excursions of any kind. Entries flagged by the model as
+    a duplicate/continuation of an earlier event are kept (so nothing
+    vanishes from the record) but marked is_duplicate so the UI can render
+    one banner instead of two for the same physical event."""
     results = []
     for event in pressure_events or []:
         observed = event.get("peak_pressure_psi")
@@ -1095,10 +1335,25 @@ def evaluate_pressure_events(pressure_events):
         variance_abs = round(observed - design, 4)
         variance_pct = round((variance_abs / design) * 100, 1)
         unit = event.get("unit") or "psi"
+        duration = event.get("duration_minutes")
+
+        if duration is None:
+            duration_status = "UNKNOWN"
+            qualifies = False
+        elif duration >= MIN_QUALIFYING_EXCURSION_MINUTES:
+            duration_status = "MEETS_THRESHOLD"
+            qualifies = True
+        else:
+            duration_status = "BELOW_THRESHOLD"
+            qualifies = False
+
         results.append({
             "event_id": event.get("event_id") or f"PE-{len(results)+1:02d}",
             "observed": observed, "design": design, "unit": unit,
             "variance_abs": variance_abs, "variance_pct": variance_pct,
+            "duration_minutes": duration,
+            "duration_status": duration_status,
+            "qualifies": qualifies,
             "timestamp_or_context": event.get("timestamp_or_context"),
             "is_duplicate": bool(event.get("is_duplicate_or_continuation")),
             "related_event_ids": event.get("related_event_ids") or [],
@@ -1167,11 +1422,35 @@ def build_risk_ledger(results, field_anomalies, pressure_excursions, ledger_item
     for pe in pressure_excursions:
         if pe["is_duplicate"]:
             continue  # same physical event as one already listed — don't double-count
-        entries["FAIL_BELOW_CRITERION"].append(
+        base = (
             f"Pressure event {pe['event_id']}: observed {pe['observed']:g} {pe['unit']} exceeds design "
             f"threshold {pe['design']:g} {pe['unit']} by +{pe['variance_abs']:g} {pe['unit']} "
             f"(+{pe['variance_pct']:g}%)"
         )
+        if pe["qualifies"]:
+            # Exceeds design pressure AND sustained >= MIN_QUALIFYING_EXCURSION_MINUTES —
+            # a confirmed qualifying overpressure excursion.
+            entries["FAIL_BELOW_CRITERION"].append(
+                f"{base}, sustained {pe['duration_minutes']:g} min — qualifies as an overpressure excursion."
+            )
+        elif pe["duration_status"] == "UNKNOWN":
+            # Exceeds design pressure but the text gives no duration — can't confirm this was
+            # sustained rather than a brief transient, so this is neither cleared nor a
+            # confirmed excursion until a human resolves the duration.
+            entries["REQUIRES_VERIFICATION"].append(
+                f"{base}, duration not stated — cannot confirm whether this meets the "
+                f"{MIN_QUALIFYING_EXCURSION_MINUTES}-minute sustained-duration threshold for a "
+                f"qualifying overpressure excursion."
+            )
+        else:  # BELOW_THRESHOLD
+            # Exceeds design pressure but the stated duration is below the sustained-excursion
+            # bar — a real logged exceedance, just not one this app treats as a confirmed
+            # qualifying excursion.
+            entries["INFORMATIONAL"].append(
+                f"{base}, sustained only {pe['duration_minutes']:g} min — below the "
+                f"{MIN_QUALIFYING_EXCURSION_MINUTES}-minute sustained-duration threshold, so not "
+                f"treated as a qualifying overpressure excursion."
+            )
 
     for a in field_anomalies:
         cat = a.get("risk_category")
@@ -1382,15 +1661,30 @@ def render_pressure_alert_banner(pe):
     if pe.get("related_event_ids"):
         dup_note = f" (related to {', '.join(pe['related_event_ids'])})"
     context = f" — {pe['timestamp_or_context']}" if pe.get("timestamp_or_context") else ""
+
+    if pe["qualifies"]:
+        headline = f"⚠ Qualifying Overpressure Excursion — {pe['event_id']}{context}"
+        duration_note = (
+            f"Sustained {pe['duration_minutes']:g} min, meeting the "
+            f"{MIN_QUALIFYING_EXCURSION_MINUTES}-minute qualification threshold."
+        )
+        closing = "Flagged for immediate operational review — do not defer to a footnote."
+    else:  # duration_status == "UNKNOWN" — below-threshold events don't reach this banner
+        headline = f"⚠ Pressure Exceedance, Duration Unconfirmed — {pe['event_id']}{context}"
+        duration_note = (
+            "No duration was stated in the source text, so this cannot yet be confirmed as a "
+            f"sustained ({MIN_QUALIFYING_EXCURSION_MINUTES}+ min) qualifying excursion."
+        )
+        closing = "Flagged as REQUIRES_VERIFICATION pending confirmation of how long this was sustained."
+
     st.markdown(
         f"<div class='pressure-alert-banner'>"
-        f"<div class='headline'>⚠ Pressure Excursion Detected — {pe['event_id']}{context}</div>"
+        f"<div class='headline'>{headline}</div>"
         f"<div class='body-text'>Observed peak of {pe['observed']:g} "
         f"{pe['unit']} against a stated design pressure threshold of "
         f"{pe['design']:g} {pe['unit']}. Threshold variance: "
         f"+{pe['variance_abs']:g} {pe['unit']} / "
-        f"+{pe['variance_pct']:g}% overload{dup_note}. Flagged for immediate operational review — "
-        f"do not defer to a footnote.</div></div>",
+        f"+{pe['variance_pct']:g}% overload. {duration_note}{dup_note}. {closing}</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -1523,10 +1817,19 @@ def render_audit_trail_expander(result, next_steps):
 
 def render_component_card(result, extracted):
     status = result["status"]
-    css_class = "blocked" if status == "blocked" else ("verified" if status == "verified" else "unresolved")
+    via_fallback = bool(result.get("via_fallback"))
+    fallback_downgrade = via_fallback and status == "verified"
+
+    if status == "blocked":
+        css_class = "blocked"
+    elif status == "verified" and not fallback_downgrade:
+        css_class = "verified"
+    else:
+        css_class = "unresolved"
+
     pill_label = {
         "blocked": "Blocked",
-        "verified": "Verified",
+        "verified": "Pending Verification" if fallback_downgrade else "Verified",
         "insufficient": "Unresolved",
         "no_measurements": "No Data",
         "no_criteria_no_measurements": "Unverified",
@@ -1539,6 +1842,12 @@ def render_component_card(result, extracted):
         f"<span class='status-pill {css_class}'>{pill_label}</span></div>",
         unsafe_allow_html=True,
     )
+
+    if via_fallback:
+        st.caption(
+            "⚙️ Recovered via the automatic fallback reparse engine (raw table structure), not the "
+            "primary extraction — treat readings as lower-confidence pending verification."
+        )
 
     # Decoupled math-vs-workflow line: the mathematical calculation_result
     # is never presented as if it were itself the workflow_status decision.
@@ -1645,6 +1954,23 @@ if uploaded is not None:
                 extracted = extract_with_claude(client, report_text)
                 manifest_text = extracted.get("flat_manifest_block", "")
                 components_matrix, parse_notices = native_parameter_matrix_parser(manifest_text, report_text)
+
+                # Automatic Fallback Pipeline Controller: only fires on the specific failure
+                # mode this stage exists for — the model's own self-assessment says the text
+                # was legible (HIGH), the raw report plainly contains table-like structure, and
+                # yet the primary parse still mapped zero components. A report that genuinely
+                # has nothing extractable (low confidence, or no table structure at all) is
+                # left to resolve as CONDITION UNVERIFIED as before, rather than retried.
+                text_extraction_confidence = (extracted.get("confidence_metrics") or {}).get("text_extraction_confidence")
+                if (
+                    text_extraction_confidence == "HIGH"
+                    and len(components_matrix) == 0
+                    and raw_text_has_components_or_tables(report_text)
+                ):
+                    fallback_components, fallback_notices = execute_fallback_reparse(report_text)
+                    components_matrix = fallback_components
+                    parse_notices = list(parse_notices) + fallback_notices
+
                 extracted["components_matrix"] = components_matrix
                 st.session_state["extracted"] = extracted
                 st.session_state["parse_notices"] = parse_notices
@@ -1668,7 +1994,7 @@ if uploaded is not None:
     # Pressure-excursion alerts always sit at the very top of the matrix panel —
     # one banner per distinct event; duplicates/continuations are folded in.
     for pe in outcome["pressure_excursions"]:
-        if not pe["is_duplicate"]:
+        if not pe["is_duplicate"] and pe["duration_status"] != "BELOW_THRESHOLD":
             render_pressure_alert_banner(pe)
 
     st.markdown("#### Global Engineering Status Ledger")
