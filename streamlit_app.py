@@ -1,6 +1,16 @@
+import subprocess
+import sys
+
+# --- AUTOMATED CLOUD DEPENDENCY INJECTION LAYER ---
+# This forces the cloud container to install anthropic natively, bypassing the requirements.txt bug entirely
+try:
+    from anthropic import Anthropic
+except ModuleNotFoundError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "anthropic"])
+    from anthropic import Anthropic
+
 import streamlit as st
 import json
-from anthropic import Anthropic
 import os
 
 # Configure high-level enterprise canvas parameters
@@ -10,7 +20,7 @@ st.set_page_config(page_title="TraceLink AI | Complete RAG Compliance Engine", l
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 anthropic_client = Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
 
-# --- STEP 1 & 2 ARCHITECTURE: THE WEB-SAFE COMPLIANCE DATA MATRIX ---
+# --- WEB-SAFE COMPLIANCE DATA MATRIX ---
 REGULATORY_MATRIX = {
     "AS9100-AEROSPACE-STANDARD": {
         "clauses": [
@@ -100,7 +110,6 @@ if uploaded_file is not None:
             is_material_fail = not any(mat.lower() in raw_report_text.lower() for mat in active_track["allowed_materials"])
             is_stress_fail = any(str(val) in raw_report_text for val in ["520.0", "390.0", "385.0"])
             
-            # Additional safety mapping variables based on report keywords
             mat_name = "Inconel-718" if "Inconel" in raw_report_text else ("Structural-Steel-A36" if "Steel" in raw_report_text else "Unknown Compound")
             stress_val = 520.0 if "520.0" in raw_report_text else (385.0 if "385.0" in raw_report_text else 210.0)
             
