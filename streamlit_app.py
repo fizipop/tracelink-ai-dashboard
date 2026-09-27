@@ -1,16 +1,6 @@
-import subprocess
-import sys
-
-# --- AUTOMATED CLOUD DEPENDENCY INJECTION LAYER ---
-# This forces the cloud container to install anthropic natively, bypassing the requirements.txt bug entirely
-try:
-    from anthropic import Anthropic
-except ModuleNotFoundError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "anthropic"])
-    from anthropic import Anthropic
-
 import streamlit as st
 import json
+from anthropic import Anthropic
 import os
 
 # Configure high-level enterprise canvas parameters
