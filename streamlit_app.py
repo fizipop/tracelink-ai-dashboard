@@ -976,7 +976,9 @@ def raw_text_has_components_or_tables(raw_report):
 
 _FALLBACK_MIN_HEADER_HINTS = ("min", "tmin", "required", "criterion", "limit")
 _FALLBACK_HISTORICAL_HEADER_HINTS = ("previous", "prior", "historical", "baseline", "last", "2024")
-_FALLBACK_SKIP_HEADER_HINTS = ("note", "notes", "comment", "remark", "confidence", "status", "visual")
+_FALLBACK_NON_BOUNDARY_HINTS = ("plate", "pad", "reinforcement", "repair", "doubler")
+_FALLBACK_CONFIDENCE_HEADER_HINTS = ("confidence",)
+_FALLBACK_SKIP_HEADER_HINTS = ("note", "notes", "comment", "remark", "status", "visual")
 
 
 def _split_pipe_row(line):
@@ -987,22 +989,60 @@ def _is_separator_row(cells):
     return bool(cells) and all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c)
 
 
+def _normalize_confidence(text):
+    """Maps a free-text confidence cell (e.g. 'Low', 'med.', 'HIGH conf.')
+    to the app's HIGH/MEDIUM/LOW vocabulary. Returns None if the cell
+    doesn't clearly say one of the three — an unrecognized cell is never
+    guessed at, just left unset."""
+    if not text:
+        return None
+    t = text.strip().lower()
+    if "low" in t:
+        return "LOW"
+    if "med" in t:
+        return "MEDIUM"
+    if "high" in t:
+        return "HIGH"
+    return None
+
+
+_INCHES_TOKEN_RE = re.compile(r'\bin(?:ches)?\b|"', re.IGNORECASE)
+
+
 def _fallback_numbers_from(col_indices, cells, header_cells):
     """Pulls every decimal/integer token out of each named column, labeling
     each with its column header (plus a numbered suffix if a single cell
-    contains more than one number, e.g. 'Initial 10.9 / Repeat 11.0')."""
+    contains more than one number, e.g. 'Initial 10.9 / Repeat 11.0').
+
+    Generic unit handling: if the cell text itself or its column header
+    contains an inches marker ("in", "inches", or a bare double-quote —
+    e.g. a cell reading '0.39 in'), the extracted number is treated as
+    inches and converted to millimeters (x25.4) before being returned, with
+    a conversion_note recording the original value/unit so nothing is
+    silently rewritten. A cell with no unit marker at all is left exactly
+    as extracted — this never guesses a unit that wasn't stated."""
     out = []
     for i in col_indices:
         if i >= len(cells):
             continue
-        tokens = re.findall(r"-?\d+\.?\d*", cells[i])
-        base_label = header_cells[i].strip() if i < len(header_cells) and header_cells[i].strip() else f"col{i}"
+        cell_text = cells[i]
+        header_text = header_cells[i] if i < len(header_cells) else ""
+        is_inches = bool(_INCHES_TOKEN_RE.search(cell_text) or _INCHES_TOKEN_RE.search(header_text))
+        tokens = re.findall(r"-?\d+\.?\d*", cell_text)
+        base_label = header_text.strip() if header_text.strip() else f"col{i}"
         for j, tok in enumerate(tokens):
             val = _coerce_float(tok)
             if val is None:
                 continue
+            conversion_note = None
+            unit = None
+            if is_inches:
+                converted = round(val * 25.4, 4)
+                conversion_note = f"Converted from {val:g} in to {converted:g} mm (x25.4)."
+                val = converted
+                unit = "mm"
             label = base_label if len(tokens) == 1 else f"{base_label}_{j + 1}"
-            out.append({"location_label": label, "value": val, "unit": None})
+            out.append({"location_label": label, "value": val, "unit": unit, "conversion_note": conversion_note})
     return out
 
 
@@ -1051,13 +1091,17 @@ def execute_fallback_reparse(raw_report):
 
         header_lower = [h.lower() for h in header_cells]
         label_col = 0  # first column is the component/location label by convention
-        min_cols, hist_cols, reading_cols = [], [], []
+        min_cols, hist_cols, reading_cols, non_boundary_cols, confidence_cols = [], [], [], [], []
         for idx, h in enumerate(header_lower):
             if idx == label_col:
                 continue
             if any(hint in h for hint in _FALLBACK_SKIP_HEADER_HINTS):
                 continue
-            if any(hint in h for hint in _FALLBACK_MIN_HEADER_HINTS):
+            if any(hint in h for hint in _FALLBACK_CONFIDENCE_HEADER_HINTS):
+                confidence_cols.append(idx)
+            elif any(hint in h for hint in _FALLBACK_NON_BOUNDARY_HINTS):
+                non_boundary_cols.append(idx)
+            elif any(hint in h for hint in _FALLBACK_MIN_HEADER_HINTS):
                 min_cols.append(idx)
             elif any(hint in h for hint in _FALLBACK_HISTORICAL_HEADER_HINTS):
                 hist_cols.append(idx)
@@ -1072,17 +1116,32 @@ def execute_fallback_reparse(raw_report):
             if not component_name:
                 continue
 
-            ut_readings = _fallback_numbers_from(reading_cols, cells, header_cells)
+            # A row whose own label names a repair/reinforcement item (e.g. "A3 Reinforcement
+            # Plate") is isolated the same way a dedicated column would be — its readings are
+            # never pressure-boundary base-metal readings, regardless of which axis names it.
+            row_is_non_boundary = any(hint in component_name.lower() for hint in _FALLBACK_NON_BOUNDARY_HINTS)
+
+            confidence_value = None
+            for ci in confidence_cols:
+                if ci < len(cells):
+                    confidence_value = _normalize_confidence(cells[ci]) or confidence_value
+
+            non_boundary_readings = _fallback_numbers_from(non_boundary_cols, cells, header_cells)
+            if row_is_non_boundary:
+                non_boundary_readings += _fallback_numbers_from(reading_cols, cells, header_cells)
+                ut_readings = []
+            else:
+                ut_readings = _fallback_numbers_from(reading_cols, cells, header_cells)
             historical_readings = _fallback_numbers_from(hist_cols, cells, header_cells)
             mat_values = _fallback_numbers_from(min_cols, cells, header_cells)
 
-            if not ut_readings and not historical_readings and not mat_values:
+            if not ut_readings and not historical_readings and not mat_values and not non_boundary_readings:
                 continue  # this row carried no recoverable numeric data at all
 
             components.append({
                 "component_name": component_name,
                 "explicit_minimum_required_mat": (
-                    {"value": mat_values[0]["value"], "unit": None} if mat_values else None
+                    {"value": mat_values[0]["value"], "unit": mat_values[0]["unit"]} if mat_values else None
                 ),
                 "mat_provenance": None,
                 "ut_provenance": {
@@ -1098,6 +1157,8 @@ def execute_fallback_reparse(raw_report):
                 },
                 "ut_thickness_measurements": ut_readings,
                 "historical_ut_thickness_measurements": historical_readings,
+                "non_pressure_boundary_measurements": non_boundary_readings,
+                "measurement_confidence": confidence_value,
                 "fallback_extracted": True,
             })
 
@@ -1169,7 +1230,8 @@ def compute_degradation(component):
     }
 
 
-def build_evaluation_summary(status, name, lowest=None, mat=None, mat_unit=None, margin=None, via_fallback=False):
+def build_evaluation_summary(status, name, lowest=None, mat=None, mat_unit=None, margin=None,
+                              via_fallback=False, low_confidence=False):
     """Decouples the mathematical calculation result from the system's
     workflow status, per the requirement that a workflow label (BLOCKED,
     etc.) must never be presented as if it were itself an engineering
@@ -1179,22 +1241,28 @@ def build_evaluation_summary(status, name, lowest=None, mat=None, mat_unit=None,
 
     via_fallback marks a component whose readings were recovered by the
     automatic fallback reparse engine (see execute_fallback_reparse) rather
-    than the primary structured extraction. Per the low/medium-confidence
-    handling rule, such a reading is never treated as a definitive pass: a
-    BLOCKED result stays BLOCKED (a fail is never softened just because the
-    read was a recovery parse), but a passing result is downgraded to
-    NEEDS_HUMAN_REVIEW rather than confidently CLEARED, since a false
-    "pass" from an unverified recovery parse is the more dangerous failure
-    mode to risk."""
+    than the primary structured extraction. low_confidence marks a
+    component the source text itself tagged LOW measurement confidence
+    (e.g. a table's own "Confidence" column). Either condition triggers the
+    same conservative handling: a BLOCKED result stays BLOCKED (a fail is
+    never softened just because the read is lower-confidence), but a
+    passing result is downgraded to NEEDS_HUMAN_REVIEW rather than
+    confidently CLEARED, since a false "pass" from an unverified or
+    low-confidence read is the more dangerous failure mode to risk."""
+    unconfirmed = via_fallback or low_confidence
     if status == "blocked":
         calculation_result = "BELOW_PROVIDED_MINIMUM"
         workflow_status = "BLOCKED"
         unit = f" {mat_unit}" if mat_unit else ""
+        cause = []
+        if via_fallback:
+            cause.append("recovered by the automatic fallback reparse engine rather than the primary extraction")
+        if low_confidence:
+            cause.append("tagged LOW measurement confidence in the source text")
         fallback_note = (
-            " This reading was recovered by the automatic fallback reparse engine, not the "
-            "primary extraction — the BLOCKED status is retained regardless, since a confirmed "
-            "exceedance is never softened on the strength of a lower-confidence read."
-        ) if via_fallback else ""
+            f" This reading was {' and '.join(cause)} — the BLOCKED status is retained regardless, "
+            "since a confirmed exceedance is never softened on the strength of a lower-confidence read."
+        ) if cause else ""
         status_explanation = (
             f"Mathematical result is BELOW_PROVIDED_MINIMUM ({name} measured {lowest['value']:.4f}{unit} "
             f"vs. {mat:.4f}{unit} required minimum, margin {margin:+.4f}). System workflow set to BLOCKED "
@@ -1204,17 +1272,22 @@ def build_evaluation_summary(status, name, lowest=None, mat=None, mat_unit=None,
         risk_category = "FAIL_BELOW_CRITERION"
     elif status == "verified":
         unit = f" {mat_unit}" if mat_unit else ""
-        if via_fallback:
-            # A passing margin recovered only via the fallback reparse engine is not treated as
-            # a definitive pass — route it to human review instead of confidently clearing it.
+        if unconfirmed:
+            # A passing margin from a lower-confidence or fallback-recovered reading is not
+            # treated as a definitive pass — route it to human review instead of clearing it.
+            cause = []
+            if via_fallback:
+                cause.append("came from the automatic fallback reparse engine rather than the primary extraction")
+            if low_confidence:
+                cause.append("is tagged LOW measurement confidence in the source text")
             calculation_result = "WITHIN_SPEC_UNCONFIRMED"
             workflow_status = "NEEDS_HUMAN_REVIEW"
             status_explanation = (
                 f"Mathematical result is WITHIN_SPEC ({name} measured {lowest['value']:.4f}{unit} vs. "
-                f"{mat:.4f}{unit} required minimum, margin {margin:+.4f}), but this reading came from "
-                f"the automatic fallback reparse engine rather than the primary extraction. System "
-                f"workflow set to NEEDS_HUMAN_REVIEW rather than CLEARED — a passing margin from a "
-                f"lower-confidence recovery parse is not treated as a definitive pass."
+                f"{mat:.4f}{unit} required minimum, margin {margin:+.4f}), but this reading "
+                f"{' and '.join(cause)}. System workflow set to NEEDS_HUMAN_REVIEW rather than "
+                f"CLEARED — a passing margin from a lower-confidence read is not treated as a "
+                f"definitive pass."
             )
             risk_category = "REQUIRES_VERIFICATION"
         else:
@@ -1286,11 +1359,15 @@ def evaluate_component(component, is_piping, piping_vars):
     margin = round(lowest["value"] - mat, 4)
     status = "blocked" if margin < 0 else "verified"
     via_fallback = bool(component.get("fallback_extracted"))
+    low_confidence = (component.get("measurement_confidence") or "").upper() == "LOW"
     evaluation_summary = build_evaluation_summary(status, name, lowest=lowest, mat=mat, mat_unit=mat_unit,
-                                                     margin=margin, via_fallback=via_fallback)
+                                                     margin=margin, via_fallback=via_fallback,
+                                                     low_confidence=low_confidence)
     return {"name": name, "status": status, "mat": mat, "mat_unit": mat_unit, "lowest": lowest,
              "margin": margin, "calc_note": calc_note, "mat_provenance": mat_provenance,
              "ut_provenance": ut_provenance, "degradation": degradation, "via_fallback": via_fallback,
+             "low_confidence": low_confidence,
+             "non_boundary_readings": component.get("non_pressure_boundary_measurements") or [],
              "evaluation_summary": evaluation_summary, "raw": component}
 
 
@@ -1818,18 +1895,19 @@ def render_audit_trail_expander(result, next_steps):
 def render_component_card(result, extracted):
     status = result["status"]
     via_fallback = bool(result.get("via_fallback"))
-    fallback_downgrade = via_fallback and status == "verified"
+    low_confidence = bool(result.get("low_confidence"))
+    unconfirmed_downgrade = (via_fallback or low_confidence) and status == "verified"
 
     if status == "blocked":
         css_class = "blocked"
-    elif status == "verified" and not fallback_downgrade:
+    elif status == "verified" and not unconfirmed_downgrade:
         css_class = "verified"
     else:
         css_class = "unresolved"
 
     pill_label = {
         "blocked": "Blocked",
-        "verified": "Pending Verification" if fallback_downgrade else "Verified",
+        "verified": "Pending Verification" if unconfirmed_downgrade else "Verified",
         "insufficient": "Unresolved",
         "no_measurements": "No Data",
         "no_criteria_no_measurements": "Unverified",
@@ -1847,6 +1925,19 @@ def render_component_card(result, extracted):
         st.caption(
             "⚙️ Recovered via the automatic fallback reparse engine (raw table structure), not the "
             "primary extraction — treat readings as lower-confidence pending verification."
+        )
+    if low_confidence:
+        st.caption(
+            "🔎 Source text tags this reading LOW measurement confidence — not treated as a "
+            "definitive pass even where the computed margin is positive."
+        )
+    non_boundary = result.get("non_boundary_readings") or []
+    if non_boundary:
+        items = ", ".join(f"{r['location_label']}={r['value']:g}{r.get('unit') or ''}" for r in non_boundary)
+        st.caption(
+            f"🛡️ Isolated non-pressure-boundary reading(s) on file for this location ({items}) — "
+            "excluded from the base-metal margin calculation above, per the reinforcement/repair "
+            "isolation rule."
         )
 
     # Decoupled math-vs-workflow line: the mathematical calculation_result
