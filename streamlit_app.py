@@ -22,13 +22,19 @@ nothing was dropped.
 Dual-pass framework:
   PASS 1 (model, via extract_with_claude): the model reads the raw
     report and returns asset-level fields (asset_category, metallurgy,
-    engineering_framework, extraction_confidence_score,
-    piping_design_variables, pressure_event, missing_engineering_
-    variables_ledger, field_anomalies) as before, PLUS a single string
-    field, "flat_manifest_block", holding every component's name,
-    stated minimum, unit, current UT readings, and any prior-inspection
-    UT readings as plain marked-up text (see FLAT_MANIFEST_FORMAT_SPEC
-    below for the exact grammar).
+    engineering_framework, jurisdiction, confidence_metrics [a
+    multi-axis HIGH/MEDIUM/LOW self-assessment, not a single ambiguous
+    float], piping_design_variables, pressure_events [an array, so
+    narrative-only excursions never vanish], missing_engineering_
+    variables_ledger, field_anomalies [each tagged with one of a strict
+    5-tier risk_category: FAIL_BELOW_CRITERION / CONFLICT /
+    MISSING_INFORMATION / INFORMATIONAL / REQUIRES_VERIFICATION]) as
+    before, PLUS a single string field, "flat_manifest_block", holding
+    every component's name, stated minimum, unit, current UT readings,
+    any prior-inspection UT readings, and optional decision-traceability
+    metadata (source document, authority tier, and a one-line reason for
+    each selected value) as plain marked-up text (see
+    FLAT_MANIFEST_FORMAT_SPEC below for the exact grammar).
   PASS 2 (plain Python, native_parameter_matrix_parser): splits that
     string on its own explicit boundary markers and reconstructs the
     same per-component structure the rest of this file already expects
@@ -318,6 +324,24 @@ st.markdown(
     .calc-trail-table { width: 100%; border-collapse: collapse; margin: 8px 0 4px 0; }
     .calc-trail-table td { padding: 4px 8px; font-size: 0.85rem; color: #E5E7EB; vertical-align: top; }
     .calc-trail-table td.label { color: #9CA3AF; white-space: nowrap; width: 1%; }
+
+    /* 5-tier risk taxonomy ledger — replaces the old flat "unresolved" bucket */
+    .risk-tier-card { border-radius: 14px; padding: 10px 16px; margin-bottom: 8px; font-size: 0.88rem; }
+    .risk-tier-card .tier-label { font-weight: 800; font-size: 0.68rem; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 3px; }
+    .risk-tier-card.tier-fail { background: rgba(69,10,10,0.4); border: 1px solid #EF4444; color: #FECACA; }
+    .risk-tier-card.tier-fail .tier-label { color: #F87171; }
+    .risk-tier-card.tier-conflict { background: rgba(120,53,15,0.35); border: 1px solid #F97316; color: #FED7AA; }
+    .risk-tier-card.tier-conflict .tier-label { color: #FB923C; }
+    .risk-tier-card.tier-missing { background: rgba(30,58,138,0.3); border: 1px solid #60A5FA; color: #DBEAFE; }
+    .risk-tier-card.tier-missing .tier-label { color: #93C5FD; }
+    .risk-tier-card.tier-verify { background: rgba(120,95,15,0.28); border: 1px solid #FBBF24; color: #FEF3C7; }
+    .risk-tier-card.tier-verify .tier-label { color: #FDE68A; }
+    .risk-tier-card.tier-info { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.15); color: #D1D5DB; }
+    .risk-tier-card.tier-info .tier-label { color: #9CA3AF; }
+
+    /* Decoupled math-vs-workflow status line inside a component card */
+    .decoupled-status-line { font-size: 0.8rem; color: #9CA3AF; margin: 4px 0 8px 0; }
+    .decoupled-status-line b { color: #E5E7EB; }
     </style>
 
     <div><div class="glass-title-container">
@@ -350,7 +374,16 @@ FLAT_MANIFEST_FORMAT_SPEC = """\
 Component: <component name, exactly as named or clearly implied in the text>
 MAT: <numeric stated minimum, only if explicitly stated — omit this whole line if none is stated>
 Unit: <unit string, e.g. in, mm — omit this whole line if no unit is stated>
+MAT_Authority_Tier: <one of the six source-precedence tiers below — omit if MAT is omitted>
+MAT_Source: <the specific document/section the minimum came from, e.g. "Design / Operating Information" — omit if unknown>
+MAT_General_Criterion: <numeric value of a general/default criterion this minimum overrides, if the text gives both a general and a special-case number — omit if not applicable>
+MAT_Reason: <one short sentence on why this minimum (vs. any other candidate number in the text) was selected — omit if there was only one candidate number>
 UT: <label>=<value>, <label>=<value>, ...   (omit this whole line if no current readings exist)
+UT_Authority_Tier: <one of the six source-precedence tiers below, for the current UT readings — omit if UT is omitted>
+UT_Source: <the specific document/section the current readings came from — omit if unknown>
+UT_Source_Date: <date of that reading, if stated — omit if unknown>
+UT_All_Values_In_Region: <every candidate value the text gave for this same location/region, comma-separated, if more than one was mentioned — omit if there was only one>
+UT_Reason: <one short sentence on why the selected lowest reading (vs. other candidates in the region) was chosen — omit if there was only one candidate>
 Historical_UT: <label>=<value>, ...          (omit this whole line if no prior-inspection readings exist)
 Component_End
 
@@ -358,7 +391,20 @@ Repeat one such block per component, separated by a blank line. Use a
 real prior location label from the text for each <label> if the text
 names sampling points (e.g. North=0.598); if the text gives readings
 with no location name at all, label them sequentially R1=, R2=, etc.
-Never invent a reading or a minimum that is not in the text."""
+Never invent a reading or a minimum that is not in the text. Every
+_Authority_Tier / _Source / _General_Criterion / _Reason line is optional
+provenance metadata — include it only when the text actually supports it;
+never fabricate a reason or a source document name.
+
+SOURCE PRECEDENCE TIERS (highest authority first — use these exact strings
+for any _Authority_Tier line, and never let a lower tier silently overwrite
+a higher one; see the CONFLICT rule below instead):
+  1. Signed Inspection / UT Official Record
+  2. Controlled Inspection Worksheet
+  3. Supplemental UT Measurement
+  4. Maintenance Note
+  5. Handwritten / Unsigned Field Note
+  6. General Narrative / Qualitative Summary"""
 
 
 SYSTEM_PROMPT = f"""You are a structured-data extraction engine for industrial \
@@ -396,12 +442,34 @@ Read the raw inspection text the user provides and call the \
   same component. Omit the line if the text gives no prior-inspection \
   reading for that component. Never treat a current-cycle reading as \
   historical, and never treat a historical reading as current.
-- "engineering_framework" is the applicable code/jurisdiction if the text \
+- SOURCE PRECEDENCE: when the text gives more than one candidate value for \
+  the same measurement or the same criterion (e.g. a signed UT sheet and a \
+  handwritten field note disagree), select the value from the highest-tier \
+  source per the precedence list above, record that choice via \
+  MAT_Authority_Tier/UT_Authority_Tier plus a one-line MAT_Reason/UT_Reason, \
+  and log every other candidate value in MAT_General_Criterion or \
+  UT_All_Values_In_Region as applicable. A lower-tier source must NEVER \
+  silently overwrite a higher-tier one. If authority truly cannot be \
+  determined (both sources carry equal apparent standing, or the text gives \
+  no way to rank them), do not silently pick one — instead add an entry to \
+  field_anomalies with risk_category "CONFLICT", naming both values and \
+  both sources in the "notes" field, and still select the higher of the two \
+  values as a conservative placeholder in the manifest so downstream \
+  calculations do not silently under-report risk.
+- "engineering_framework" is the applicable governing code if the text \
   states or clearly implies one (e.g. "ASME Sec VIII", "ASME B31.3", \
-  "AWS D1.1", "API 653"); null if not determinable.
-- "extraction_confidence_score" is your own 0.0-1.0 estimate of how legible \
-  and unambiguous the source text was for this extraction — not a measure \
-  of the asset's physical condition.
+  "AWS D1.1", "API 653"); null if not determinable. "jurisdiction" is the \
+  applicable regulatory jurisdiction/authority if stated (e.g. a state \
+  boiler/pressure-vessel jurisdiction, a client/site standard); null if not \
+  determinable. Both are asset-level, not per-component.
+- "confidence_metrics" is your own self-assessment, not a measure of the \
+  asset's physical condition: text_extraction_confidence (HIGH/MEDIUM/LOW) \
+  rates how legible and unambiguous the source text itself was; \
+  calculation_confidence (HIGH/MEDIUM/LOW) rates how confident you are that \
+  the values you selected are the ones a careful human would have picked \
+  (lower this whenever you had to apply the source-precedence rule above); \
+  source_conflict_level (NONE/LOW/MEDIUM/HIGH) rates how much the source \
+  documents disagreed with each other across the whole report.
 - "piping_design_variables" (design pressure, outside diameter, allowable \
   stress, quality/joint factor, Y coefficient, corrosion allowance) apply at \
   the asset level and are only relevant for process piping. Extract each \
@@ -409,26 +477,51 @@ Read the raw inspection text the user provides and call the \
   value (typically a large number, e.g. in the thousands, in psi or MPa) \
   with an adjacent small decimal thickness reading — they are different \
   quantities even when they appear near each other in the text.
-- "pressure_event" captures a single logged operating-pressure excursion at \
-  the asset level: the observed/peak pressure reading and the stated design \
-  pressure threshold, only if the text explicitly gives both. Leave both \
-  null if either is not explicitly stated. Do not confuse this with the \
-  B31.3 design_pressure used for wall-thickness calculation — record both \
-  independently even if they share the same numeric value.
+- "pressure_events" is an array — capture EVERY distinct logged \
+  operating-pressure excursion, startup spike, or upset mentioned anywhere \
+  in the text, including in narrative operator logs or notes, not only ones \
+  that appear in a data table. Each entry needs a unique event_id you assign \
+  (e.g. "PE-01"), the peak/observed pressure, the stated design pressure \
+  threshold, timestamp_or_context (whatever time/context marker the text \
+  gives, e.g. "09:42 startup upset"), is_duplicate_or_continuation (true if \
+  this entry is the same physical event as an earlier one just mentioned \
+  again elsewhere in the text, e.g. re-stated in a summary paragraph), and \
+  related_event_ids (the event_id(s) it duplicates or continues, if any). \
+  Do NOT compute variance yourself — that arithmetic is done afterward in \
+  plain Python from the two pressure values you provide. Only include an \
+  event if both the observed and design pressure are explicitly stated.
 - Preserve stated uncertainty rather than resolving it. A "possible" or \
-  "suspected" weld indication must be recorded as an unconfirmed finding \
-  (is_confirmed_failure: false) with notes describing it as needing NDT \
-  validation — never upgraded to a confirmed defect. A corroded, loose, or \
-  unverified fastener must likewise be recorded as unconfirmed, with notes \
-  describing it as pending torque verification — never as a confirmed \
-  connection failure. Only set is_confirmed_failure: true when the text \
-  itself states the item failed, is rejected, or is out of tolerance.
-- "field_anomalies" should capture every inspector note, flagged indication, \
-  weld observation, fastener condition note, or geometry/alignment issue, in \
-  the report's own words in the "notes" field.
-- Do not comment on overall compliance, pass/fail, or safety — only extract \
-  data as stated. All pass/fail comparison, degradation-delta, and pressure- \
-  variance math is performed afterward in plain Python, not by you."""
+  "suspected" weld indication must be recorded in field_anomalies with \
+  risk_category "REQUIRES_VERIFICATION" and notes describing it as needing \
+  NDT validation — never upgraded to a confirmed defect. A corroded, loose, \
+  or unverified fastener must likewise be risk_category \
+  "REQUIRES_VERIFICATION", with notes describing it as pending torque \
+  verification — never treated as a confirmed connection failure.
+- "field_anomalies" uses a strict 5-tier, mutually-exclusive risk_category \
+  for every entry — pick exactly one per finding:
+    - FAIL_BELOW_CRITERION: a numerical measurement is stated in the text \
+      itself (in prose, not just in the manifest) as strictly below an \
+      explicitly provided requirement.
+    - CONFLICT: two data sources directly disagree and authority cannot be \
+      automatically resolved (see SOURCE PRECEDENCE above).
+    - MISSING_INFORMATION: data required for a critical calculation or \
+      evaluation was not supplied anywhere in the text.
+    - INFORMATIONAL: historical repairs/replacements, superseded readings \
+      (e.g. an old reading explicitly replaced by a newer one), duplicate \
+      unit conversions, or routine qualitative observations with no safety \
+      implication (e.g. "looks fine").
+    - REQUIRES_VERIFICATION: a physical/visual anomaly (unconfirmed weld \
+      indication, surface corrosion, alignment offset) needing human or NDT \
+      inspection before it can be called confirmed or dismissed.
+  Capture every inspector note, flagged indication, weld observation, \
+  fastener condition note, superseded/replaced reading, or geometry/ \
+  alignment issue, in the report's own words in the "notes" field.
+- Do not comment on overall compliance, pass/fail, or safety, and do not \
+  recommend a specific code-level action (e.g. "perform an API 579 FFS \
+  assessment") anywhere in free text — only extract data as stated. All \
+  pass/fail comparison, degradation-delta, pressure-variance math, and any \
+  code-specific recommendation gating are performed afterward in plain \
+  Python, not by you."""
 
 EXTRACTION_TOOL = {
     "name": "extract_compliance_data",
@@ -449,11 +542,20 @@ EXTRACTION_TOOL = {
             },
             "engineering_framework": {
                 "type": ["string", "null"],
-                "description": "Auto-discovered applicable code/jurisdiction, e.g. ASME Sec VIII, ASME B31.3, AWS D1.1, API 653.",
+                "description": "Auto-discovered applicable governing code, e.g. ASME Sec VIII, ASME B31.3, AWS D1.1, API 653.",
             },
-            "extraction_confidence_score": {
-                "type": ["number", "null"],
-                "description": "0.0-1.0 self-estimate of extraction legibility/confidence.",
+            "jurisdiction": {
+                "type": ["string", "null"],
+                "description": "Applicable regulatory jurisdiction/authority or site/client standard, only if explicitly stated.",
+            },
+            "confidence_metrics": {
+                "type": ["object", "null"],
+                "description": "Multi-axis self-assessment, replacing a single ambiguous float score.",
+                "properties": {
+                    "text_extraction_confidence": {"type": ["string", "null"], "enum": ["HIGH", "MEDIUM", "LOW", None]},
+                    "calculation_confidence": {"type": ["string", "null"], "enum": ["HIGH", "MEDIUM", "LOW", None]},
+                    "source_conflict_level": {"type": ["string", "null"], "enum": ["NONE", "LOW", "MEDIUM", "HIGH", None]},
+                },
             },
             "piping_design_variables": {
                 "type": ["object", "null"],
@@ -467,20 +569,34 @@ EXTRACTION_TOOL = {
                     "corrosion_allowance": {"type": ["number", "null"]},
                 },
             },
-            "pressure_event": {
-                "type": ["object", "null"],
-                "description": "A single logged operating-pressure excursion at the asset level, only if both values are explicitly stated.",
-                "properties": {
-                    "observed_pressure": {"type": ["number", "null"]},
-                    "design_pressure_threshold": {"type": ["number", "null"]},
-                    "unit": {"type": ["string", "null"]},
+            "pressure_events": {
+                "type": "array",
+                "description": (
+                    "Every distinct logged pressure excursion/startup spike/upset found anywhere in the "
+                    "text, including narrative operator logs — not just tabular data. Variance is computed "
+                    "in Python afterward, not by the model."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "event_id": {"type": "string"},
+                        "peak_pressure_psi": {"type": ["number", "null"]},
+                        "design_pressure_psi": {"type": ["number", "null"]},
+                        "unit": {"type": ["string", "null"]},
+                        "timestamp_or_context": {"type": ["string", "null"]},
+                        "is_duplicate_or_continuation": {"type": "boolean"},
+                        "related_event_ids": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["event_id", "is_duplicate_or_continuation"],
                 },
             },
             "flat_manifest_block": {
                 "type": "string",
                 "description": (
                     "Every component's data as plain marked-up text (Component: / MAT: / Unit: / "
-                    "UT: / Historical_UT: / Component_End), one block per component. See system "
+                    "MAT_Authority_Tier: / MAT_Source: / MAT_General_Criterion: / MAT_Reason: / UT: / "
+                    "UT_Authority_Tier: / UT_Source: / UT_Source_Date: / UT_All_Values_In_Region: / "
+                    "UT_Reason: / Historical_UT: / Component_End), one block per component. See system "
                     "prompt for the exact grammar. This replaces a nested JSON components array."
                 ),
             },
@@ -495,10 +611,13 @@ EXTRACTION_TOOL = {
                     "type": "object",
                     "properties": {
                         "finding": {"type": "string"},
-                        "is_confirmed_failure": {"type": "boolean"},
+                        "risk_category": {
+                            "type": "string",
+                            "enum": ["FAIL_BELOW_CRITERION", "CONFLICT", "MISSING_INFORMATION", "INFORMATIONAL", "REQUIRES_VERIFICATION"],
+                        },
                         "notes": {"type": ["string", "null"]},
                     },
-                    "required": ["finding", "is_confirmed_failure"],
+                    "required": ["finding", "risk_category"],
                 },
             },
         },
@@ -630,29 +749,74 @@ def _parse_reading_list(line_value, fallback_unit):
     return readings
 
 
+def _parse_float_list(line_value):
+    """Parses a plain comma-separated list of numbers (e.g.
+    'UT_All_Values_In_Region: 18.2, 18.1, 17.8') into a list of floats,
+    silently dropping any token that isn't a number."""
+    if not line_value:
+        return []
+    values = []
+    for part in line_value.split(","):
+        v = _coerce_float(part)
+        if v is not None:
+            values.append(v)
+    return values
+
+
+# Line-prefix -> field name for the optional provenance/traceability lines.
+# Kept as a table (rather than a long elif chain) since it's the same
+# pattern repeated for MAT_* and UT_* — makes it easy to extend later.
+_PROVENANCE_LINE_MAP = {
+    "mat_authority_tier:": "mat_authority_tier",
+    "mat_source:": "mat_source",
+    "mat_general_criterion:": "mat_general_criterion",
+    "mat_reason:": "mat_reason",
+    "ut_authority_tier:": "ut_authority_tier",
+    "ut_source:": "ut_source",
+    "ut_source_date:": "ut_source_date",
+    "ut_all_values_in_region:": "ut_all_values_in_region",
+    "ut_reason:": "ut_reason",
+}
+
+
 def _parse_single_component_block(block_text):
     """Parses one 'Component: ... ' block (already stripped of its trailing
     Component_End marker) into the component dict shape evaluate_component()
-    expects. Returns None if the block has no recognizable component name."""
+    expects, including optional decision-traceability metadata. Returns None
+    if the block has no recognizable component name."""
     component_name = None
     mat_value = None
     mat_unit = None
     ut_line_value = None
     historical_line_value = None
+    provenance_raw = {}
 
     for line in block_text.splitlines():
         line = line.strip()
         if not line:
             continue
-        if line.lower().startswith("component:"):
+        line_lower = line.lower()
+        if line_lower.startswith("component:"):
             component_name = line.split(":", 1)[1].strip()
-        elif line.lower().startswith("mat:"):
+        elif line_lower.startswith("mat_"):
+            # Check the longer MAT_* provenance prefixes before the bare
+            # "mat:" check below, since "mat_reason:" also starts with "mat".
+            for prefix, field in _PROVENANCE_LINE_MAP.items():
+                if line_lower.startswith(prefix):
+                    provenance_raw[field] = line.split(":", 1)[1].strip()
+                    break
+        elif line_lower.startswith("mat:"):
             mat_value = _coerce_float(line.split(":", 1)[1])
-        elif line.lower().startswith("unit:"):
+        elif line_lower.startswith("unit:"):
             mat_unit = line.split(":", 1)[1].strip() or None
-        elif line.lower().startswith("historical_ut:"):
+        elif line_lower.startswith("historical_ut:"):
             historical_line_value = line.split(":", 1)[1]
-        elif line.lower().startswith("ut:"):
+        elif line_lower.startswith("ut_"):
+            for prefix, field in _PROVENANCE_LINE_MAP.items():
+                if line_lower.startswith(prefix):
+                    provenance_raw[field] = line.split(":", 1)[1].strip()
+                    break
+        elif line_lower.startswith("ut:"):
             ut_line_value = line.split(":", 1)[1]
 
     if not component_name:
@@ -661,11 +825,32 @@ def _parse_single_component_block(block_text):
     ut_readings = _parse_reading_list(ut_line_value, mat_unit)
     historical_readings = _parse_reading_list(historical_line_value, mat_unit)
 
+    mat_provenance = None
+    if any(k in provenance_raw for k in ("mat_authority_tier", "mat_source", "mat_general_criterion", "mat_reason")):
+        mat_provenance = {
+            "authority_tier": provenance_raw.get("mat_authority_tier"),
+            "source": provenance_raw.get("mat_source"),
+            "general_criterion": _coerce_float(provenance_raw.get("mat_general_criterion")),
+            "reason": provenance_raw.get("mat_reason"),
+        }
+
+    ut_provenance = None
+    if any(k in provenance_raw for k in ("ut_authority_tier", "ut_source", "ut_source_date", "ut_all_values_in_region", "ut_reason")):
+        ut_provenance = {
+            "authority_tier": provenance_raw.get("ut_authority_tier"),
+            "source": provenance_raw.get("ut_source"),
+            "source_date": provenance_raw.get("ut_source_date"),
+            "all_values_in_region": _parse_float_list(provenance_raw.get("ut_all_values_in_region")),
+            "reason": provenance_raw.get("ut_reason"),
+        }
+
     return {
         "component_name": component_name,
         "explicit_minimum_required_mat": (
             {"value": mat_value, "unit": mat_unit} if mat_value is not None else None
         ),
+        "mat_provenance": mat_provenance,
+        "ut_provenance": ut_provenance,
         "ut_thickness_measurements": ut_readings,
         "historical_ut_thickness_measurements": historical_readings,
     }
@@ -794,6 +979,49 @@ def compute_degradation(component):
     }
 
 
+def build_evaluation_summary(status, name, lowest=None, mat=None, mat_unit=None, margin=None):
+    """Decouples the mathematical calculation result from the system's
+    workflow status, per the requirement that a workflow label (BLOCKED,
+    etc.) must never be presented as if it were itself an engineering
+    determination. Both fields, and the explanation joining them, are built
+    here in plain Python from numbers already computed elsewhere — never
+    asked of the model."""
+    if status == "blocked":
+        calculation_result = "BELOW_PROVIDED_MINIMUM"
+        workflow_status = "BLOCKED"
+        unit = f" {mat_unit}" if mat_unit else ""
+        status_explanation = (
+            f"Mathematical result is BELOW_PROVIDED_MINIMUM ({name} measured {lowest['value']:.4f}{unit} "
+            f"vs. {mat:.4f}{unit} required minimum, margin {margin:+.4f}). System workflow set to BLOCKED "
+            f"per safety policy — this is a workflow decision, not itself an engineering disposition."
+        )
+        risk_category = "FAIL_BELOW_CRITERION"
+    elif status == "verified":
+        calculation_result = "WITHIN_SPEC"
+        workflow_status = "CLEARED"
+        unit = f" {mat_unit}" if mat_unit else ""
+        status_explanation = (
+            f"Mathematical result is WITHIN_SPEC ({name} measured {lowest['value']:.4f}{unit} vs. "
+            f"{mat:.4f}{unit} required minimum, margin {margin:+.4f}). System workflow set to CLEARED."
+        )
+        risk_category = None
+    else:  # insufficient / no_measurements / no_criteria_no_measurements
+        calculation_result = "INSUFFICIENT_DATA"
+        workflow_status = "NEEDS_HUMAN_REVIEW"
+        status_explanation = (
+            f"Mathematical result is INSUFFICIENT_DATA for {name} — a margin cannot be computed from "
+            f"what the source text provides. System workflow set to NEEDS_HUMAN_REVIEW, not BLOCKED, "
+            f"since this reflects a data gap rather than a confirmed exceedance."
+        )
+        risk_category = "MISSING_INFORMATION"
+    return {
+        "calculation_result": calculation_result,
+        "workflow_status": workflow_status,
+        "status_explanation": status_explanation,
+        "risk_category": risk_category,
+    }
+
+
 def evaluate_component(component, is_piping, piping_vars):
     """is_piping gates the B31.3 fallback so it never fires for structural steel
     or other non-pressurized assets."""
@@ -803,53 +1031,160 @@ def evaluate_component(component, is_piping, piping_vars):
     mat = mat_field.get("value") if mat_field else None
     mat_unit = mat_field.get("unit") if mat_field else None
     degradation = compute_degradation(component)
+    mat_provenance = component.get("mat_provenance")
+    ut_provenance = component.get("ut_provenance")
 
     if not ut_list:
         # Distinguish "we have a stated minimum but nothing to test it against"
         # from "we have neither criteria nor measurements at all" — the two
         # are engineering-critical to tell apart in the UI.
         status = "no_measurements" if mat is not None else "no_criteria_no_measurements"
+        evaluation_summary = build_evaluation_summary(status, name)
         return {"name": name, "status": status, "mat": mat, "mat_unit": mat_unit,
-                 "degradation": degradation, "raw": component}
+                 "mat_provenance": mat_provenance, "ut_provenance": ut_provenance,
+                 "degradation": degradation, "evaluation_summary": evaluation_summary, "raw": component}
 
     calc_note = None
     if mat is None:
         if is_piping:
             mat, missing, calc_note = calc_b31_3_mat(piping_vars)
             if mat is None:
+                evaluation_summary = build_evaluation_summary("insufficient", name)
                 return {"name": name, "status": "insufficient", "missing_vars": missing,
-                         "ut_measurements": ut_list, "degradation": degradation, "raw": component}
+                         "ut_measurements": ut_list, "mat_provenance": mat_provenance,
+                         "ut_provenance": ut_provenance, "degradation": degradation,
+                         "evaluation_summary": evaluation_summary, "raw": component}
         else:
+            evaluation_summary = build_evaluation_summary("insufficient", name)
             return {"name": name, "status": "insufficient",
                      "missing_vars": ["Explicit Minimum Required MAT (not stated for this component)"],
-                     "ut_measurements": ut_list, "degradation": degradation, "raw": component}
+                     "ut_measurements": ut_list, "mat_provenance": mat_provenance,
+                     "ut_provenance": ut_provenance, "degradation": degradation,
+                     "evaluation_summary": evaluation_summary, "raw": component}
 
     lowest = min(ut_list, key=lambda r: r["value"])
     margin = round(lowest["value"] - mat, 4)
     status = "blocked" if margin < 0 else "verified"
+    evaluation_summary = build_evaluation_summary(status, name, lowest=lowest, mat=mat, mat_unit=mat_unit, margin=margin)
     return {"name": name, "status": status, "mat": mat, "mat_unit": mat_unit, "lowest": lowest,
-             "margin": margin, "calc_note": calc_note, "degradation": degradation, "raw": component}
+             "margin": margin, "calc_note": calc_note, "mat_provenance": mat_provenance,
+             "ut_provenance": ut_provenance, "degradation": degradation,
+             "evaluation_summary": evaluation_summary, "raw": component}
 
 
-def evaluate_pressure_event(pressure_event):
-    """Plain-Python variance calc for a logged overpressure excursion.
-    Returns None unless both values are explicitly present and the observed
-    reading actually exceeds the design threshold."""
-    if not pressure_event:
-        return None
-    observed = pressure_event.get("observed_pressure")
-    design = pressure_event.get("design_pressure_threshold")
-    if observed is None or design is None or design == 0:
-        return None
-    if observed <= design:
-        return None
-    variance_abs = round(observed - design, 4)
-    variance_pct = round((variance_abs / design) * 100, 1)
-    unit = pressure_event.get("unit") or "psi"
-    return {
-        "observed": observed, "design": design, "unit": unit,
-        "variance_abs": variance_abs, "variance_pct": variance_pct,
-    }
+def evaluate_pressure_events(pressure_events):
+    """Plain-Python variance calc for every logged overpressure excursion.
+    The model supplies event_id/peak/design/timestamp/duplicate-flag only —
+    variance_abs and variance_pct are always computed here, never trusted
+    from the model, per this file's standing rule that safety-relevant
+    arithmetic is never asked of the LLM. Returns a list of dicts, one per
+    event that actually exceeds its design threshold (an event that comes in
+    at or under threshold is dropped — it isn't an excursion). Entries
+    flagged by the model as a duplicate/continuation of an earlier event are
+    kept in the list (so nothing vanishes from the record) but marked
+    is_duplicate so the UI can render one banner instead of two for the same
+    physical event."""
+    results = []
+    for event in pressure_events or []:
+        observed = event.get("peak_pressure_psi")
+        design = event.get("design_pressure_psi")
+        if observed is None or design is None or design == 0:
+            continue
+        if observed <= design:
+            continue
+        variance_abs = round(observed - design, 4)
+        variance_pct = round((variance_abs / design) * 100, 1)
+        unit = event.get("unit") or "psi"
+        results.append({
+            "event_id": event.get("event_id") or f"PE-{len(results)+1:02d}",
+            "observed": observed, "design": design, "unit": unit,
+            "variance_abs": variance_abs, "variance_pct": variance_pct,
+            "timestamp_or_context": event.get("timestamp_or_context"),
+            "is_duplicate": bool(event.get("is_duplicate_or_continuation")),
+            "related_event_ids": event.get("related_event_ids") or [],
+        })
+    return results
+
+
+GENERIC_NEXT_STEPS = [
+    "Verify governing code/standard and jurisdictional compliance requirements.",
+    "Confirm localized thinning via additional ultrasonic thickness (UT) sweeps.",
+    "Determine applicability of a Fitness-for-Service (FFS) evaluation once metallurgy and design basis are confirmed.",
+]
+
+
+def has_governing_context(extracted):
+    """True only when governing code, jurisdiction, and metallurgy are ALL
+    explicitly stated — the gate the system prompt itself is barred from
+    bypassing when recommending anything code-specific."""
+    return bool(
+        (extracted.get("engineering_framework") or "").strip()
+        and (extracted.get("jurisdiction") or "").strip()
+        and (extracted.get("metallurgy_specification") or "").strip()
+    )
+
+
+def build_next_steps(component_name, extracted):
+    """Gates specific, code-referencing remediation steps behind having a
+    governing code + jurisdiction + metallurgy on file. Without all three,
+    only the conservative, generic next-steps list is shown — the system
+    never recommends a specific code pathway (e.g. "API 579 FFS") when it
+    doesn't actually know what code or jurisdiction governs this asset."""
+    if has_governing_context(extracted):
+        return remediation_steps(component_name)
+    return list(GENERIC_NEXT_STEPS)
+
+
+RISK_TIER_ORDER = ["FAIL_BELOW_CRITERION", "CONFLICT", "MISSING_INFORMATION", "REQUIRES_VERIFICATION", "INFORMATIONAL"]
+
+
+def build_risk_ledger(results, field_anomalies, pressure_excursions, ledger_items):
+    """Assembles the unified 5-tier risk ledger, replacing the old flat
+    'UNRESOLVED / Requires Validation' bucket. Every entry is plain-Python
+    generated text; the tier a component-level entry lands in is decided by
+    evaluate_component()'s deterministic status, not by the model. Model-
+    supplied field_anomalies keep whichever of the 5 tiers the model
+    assigned (falling back to REQUIRES_VERIFICATION for anything malformed,
+    which is the most conservative tier to default into)."""
+    entries = {tier: [] for tier in RISK_TIER_ORDER}
+
+    for r in results:
+        cat = (r.get("evaluation_summary") or {}).get("risk_category")
+        if cat == "FAIL_BELOW_CRITERION":
+            unit = f" {r['mat_unit']}" if r.get("mat_unit") else ""
+            entries[cat].append(
+                f"{r['name']}: measured {r['lowest']['value']:.4f}{unit} vs. required "
+                f"{r['mat']:.4f}{unit} (margin {r['margin']:+.4f})"
+            )
+        elif cat == "MISSING_INFORMATION":
+            if r["status"] == "no_criteria_no_measurements":
+                entries[cat].append(f"{r['name']}: no design acceptance criteria or wall-thickness examination metrics provided")
+            elif r["status"] == "no_measurements":
+                entries[cat].append(f"{r['name']}: stated minimum on file but no UT readings extracted")
+            else:
+                entries[cat].append(f"{r['name']}: margin uncalculable — missing engineering variables")
+
+    for pe in pressure_excursions:
+        if pe["is_duplicate"]:
+            continue  # same physical event as one already listed — don't double-count
+        entries["FAIL_BELOW_CRITERION"].append(
+            f"Pressure event {pe['event_id']}: observed {pe['observed']:g} {pe['unit']} exceeds design "
+            f"threshold {pe['design']:g} {pe['unit']} by +{pe['variance_abs']:g} {pe['unit']} "
+            f"(+{pe['variance_pct']:g}%)"
+        )
+
+    for a in field_anomalies:
+        cat = a.get("risk_category")
+        if cat not in entries:
+            cat = "REQUIRES_VERIFICATION"  # conservative default for a malformed/missing category
+        label = a.get("finding") or "unspecified finding"
+        notes = a.get("notes")
+        entries[cat].append(label + (f" — {notes}" if notes else ""))
+
+    for item in ledger_items:
+        entries["MISSING_INFORMATION"].append(item)
+
+    return entries
 
 
 def evaluate(extracted):
@@ -862,72 +1197,77 @@ def evaluate(extracted):
     blocked = [r for r in results if r["status"] == "blocked"]
     unresolved = [r for r in results if r["status"] in ("insufficient", "no_measurements", "no_criteria_no_measurements")]
     degradations = [r["degradation"] for r in results if r.get("degradation") and r["degradation"]["is_loss"]]
-    confirmed_failures = [a for a in (extracted.get("field_anomalies") or []) if a.get("is_confirmed_failure")]
-    unconfirmed_findings = [a for a in (extracted.get("field_anomalies") or []) if not a.get("is_confirmed_failure")]
-    ledger = extracted.get("missing_engineering_variables_ledger") or []
-    pressure_excursion = evaluate_pressure_event(extracted.get("pressure_event"))
+    field_anomalies = extracted.get("field_anomalies") or []
+    ledger_items = extracted.get("missing_engineering_variables_ledger") or []
+    pressure_excursions = evaluate_pressure_events(extracted.get("pressure_events"))
 
-    if not results:
+    risk_ledger = build_risk_ledger(results, field_anomalies, pressure_excursions, ledger_items)
+    has_fail = bool(risk_ledger["FAIL_BELOW_CRITERION"])
+    has_other_open_risk = any(risk_ledger[t] for t in ("CONFLICT", "MISSING_INFORMATION", "REQUIRES_VERIFICATION"))
+
+    if not results and not any(risk_ledger.values()):
         global_status = "CONDITION UNVERIFIED"
-    elif blocked or confirmed_failures:
+    elif has_fail:
         global_status = "BLOCKED"
-    elif unresolved or ledger:
+    elif has_other_open_risk:
         global_status = "CONDITION UNVERIFIED"
     else:
         global_status = "VERIFIED SECURE"
 
-    ledger_message = build_status_ledger_message(
-        global_status, blocked, unresolved, pressure_excursion, unconfirmed_findings
-    )
+    ledger_message = build_status_ledger_message(global_status, risk_ledger)
+
+    raw_confidence = extracted.get("confidence_metrics") or {}
+    confidence_metrics = {
+        "text_extraction_confidence": raw_confidence.get("text_extraction_confidence") or "UNKNOWN",
+        "calculation_confidence": raw_confidence.get("calculation_confidence") or "UNKNOWN",
+        "source_conflict_level": raw_confidence.get("source_conflict_level") or "UNKNOWN",
+        # Hardcoded, never asked of the model: this app makes no independent
+        # engineering determination under any circumstance, so this axis is
+        # always the same fixed value rather than something the model could
+        # accidentally claim otherwise.
+        "engineering_determination": "NOT_AVAILABLE",
+    }
 
     return {"results": results, "blocked": blocked, "unresolved": unresolved,
-             "confirmed_failures": confirmed_failures, "unconfirmed_findings": unconfirmed_findings,
-             "degradations": degradations, "pressure_excursion": pressure_excursion,
-             "global_status": global_status, "ledger_message": ledger_message}
+             "field_anomalies": field_anomalies, "degradations": degradations,
+             "pressure_excursions": pressure_excursions, "risk_ledger": risk_ledger,
+             "global_status": global_status, "ledger_message": ledger_message,
+             "confidence_metrics": confidence_metrics}
 
 
-def build_status_ledger_message(global_status, blocked, unresolved, pressure_excursion, unconfirmed_findings):
+def build_status_ledger_message(global_status, risk_ledger):
     """Builds a context-specific diagnostic sentence naming the exact
-    parameters driving the restriction, instead of a bare status word."""
+    parameters driving the restriction, drawn from the tiered risk ledger,
+    instead of a bare status word — and explicitly notes that the workflow
+    label is a policy decision, not an independent engineering determination
+    (requirement: decouple workflow status from mathematical results)."""
     if global_status == "VERIFIED SECURE":
-        return "VERIFIED SECURE: All mapped components carry a stated criteria set and a current reading at or above minimum. No confirmed exceedances on file."
+        return ("VERIFIED SECURE: All mapped components carry a stated criteria set and a current "
+                "reading at or above minimum. No confirmed exceedances or open risk items on file.")
 
-    risk_entries = []
-    lead = None
+    fails = risk_ledger.get("FAIL_BELOW_CRITERION", [])
+    other_entries = []
+    for tier in ("CONFLICT", "MISSING_INFORMATION", "REQUIRES_VERIFICATION"):
+        other_entries.extend(risk_ledger.get(tier, []))
 
-    if blocked:
-        worst = min(blocked, key=lambda r: r["margin"])
-        lead = f"{worst['name']} thickness drops below the stated minimum threshold"
-        for r in blocked:
-            unit = f" {r['mat_unit']}" if r.get("mat_unit") else ""
-            risk_entries.append(f"{r['name']} margin {r['margin']:+.4f}{unit} below minimum")
-
-    if pressure_excursion:
-        risk_entries.append(
-            f"{pressure_excursion['observed']:g} {pressure_excursion['unit']} overpressure excursion "
-            f"(+{pressure_excursion['variance_abs']:g} {pressure_excursion['unit']} / "
-            f"+{pressure_excursion['variance_pct']:g}%)"
-        )
-
-    for r in unresolved:
-        if r["status"] == "no_criteria_no_measurements":
-            risk_entries.append(f"unverified {r['name'].lower()} — no criteria or readings on file")
-        elif r["status"] == "no_measurements":
-            risk_entries.append(f"unverified {r['name'].lower()} — criteria on file but untested")
-        elif r["status"] == "insufficient":
-            risk_entries.append(f"{r['name'].lower()} margin uncalculable — missing engineering variables")
-
-    for a in unconfirmed_findings:
-        risk_entries.append(f"unconfirmed finding pending NDT validation ({a.get('finding', 'unspecified')})")
-
-    if not risk_entries:
+    if fails:
+        lead = fails[0]
+    elif other_entries:
+        lead = other_entries[0]
+    else:
         return f"{global_status}: No mapped components resolved to a confirmed status; awaiting further data."
 
-    if lead is None:
-        lead = f"{len(risk_entries)} unresolved risk item(s) on file"
+    all_entries = fails + other_entries
+    trailing = [e for e in all_entries if e != lead]
 
-    entries_text = "; ".join(risk_entries)
-    return f"{global_status}: {lead}. Unresolved risk entries include: {entries_text}."
+    if not trailing:
+        return (f"{global_status}: {lead}. (Workflow status reflects system safety policy — see the "
+                f"risk taxonomy ledger below for how each item was categorized, not an independent "
+                f"engineering determination.)")
+
+    entries_text = "; ".join(trailing)
+    return (f"{global_status}: {lead}. Unresolved risk entries include: {entries_text}. (Workflow "
+            f"status reflects system safety policy, not an independent engineering determination.)")
 
 
 def remediation_steps(component_name):
@@ -1037,18 +1377,62 @@ def metric_html(label, value, accent=None):
     return f"<div class='glass-card'><div class='metric-label'>{label}</div><div class='{cls}'>{value}</div></div>"
 
 
-def render_pressure_alert_banner(pressure_excursion):
+def render_pressure_alert_banner(pe):
+    dup_note = ""
+    if pe.get("related_event_ids"):
+        dup_note = f" (related to {', '.join(pe['related_event_ids'])})"
+    context = f" — {pe['timestamp_or_context']}" if pe.get("timestamp_or_context") else ""
     st.markdown(
         f"<div class='pressure-alert-banner'>"
-        f"<div class='headline'>⚠ Pressure Excursion Detected</div>"
-        f"<div class='body-text'>Observed peak of {pressure_excursion['observed']:g} "
-        f"{pressure_excursion['unit']} against a stated design pressure threshold of "
-        f"{pressure_excursion['design']:g} {pressure_excursion['unit']}. Threshold variance: "
-        f"+{pressure_excursion['variance_abs']:g} {pressure_excursion['unit']} / "
-        f"+{pressure_excursion['variance_pct']:g}% overload. Flagged for immediate operational review — "
+        f"<div class='headline'>⚠ Pressure Excursion Detected — {pe['event_id']}{context}</div>"
+        f"<div class='body-text'>Observed peak of {pe['observed']:g} "
+        f"{pe['unit']} against a stated design pressure threshold of "
+        f"{pe['design']:g} {pe['unit']}. Threshold variance: "
+        f"+{pe['variance_abs']:g} {pe['unit']} / "
+        f"+{pe['variance_pct']:g}% overload{dup_note}. Flagged for immediate operational review — "
         f"do not defer to a footnote.</div></div>",
         unsafe_allow_html=True,
     )
+
+
+_TIER_CSS = {
+    "FAIL_BELOW_CRITERION": "tier-fail",
+    "CONFLICT": "tier-conflict",
+    "MISSING_INFORMATION": "tier-missing",
+    "REQUIRES_VERIFICATION": "tier-verify",
+    "INFORMATIONAL": "tier-info",
+}
+_TIER_LABELS = {
+    "FAIL_BELOW_CRITERION": "Fail — Below/Outside Criterion",
+    "CONFLICT": "Conflict — Sources Disagree",
+    "MISSING_INFORMATION": "Missing Information",
+    "REQUIRES_VERIFICATION": "Requires Verification (NDT/Human)",
+    "INFORMATIONAL": "Informational",
+}
+
+
+def render_risk_taxonomy_ledger(risk_ledger):
+    """Renders the strict 5-tier risk ledger, replacing the old flat
+    'UNRESOLVED / Requires Validation' bucket with mutually-exclusive,
+    clearly labeled categories."""
+    any_entries = any(risk_ledger.values())
+    if not any_entries:
+        st.markdown(
+            "<div class='risk-tier-card tier-info'><div class='tier-label'>Nothing Outstanding</div>"
+            "No risk-ledger entries in any of the 5 tiers.</div>",
+            unsafe_allow_html=True,
+        )
+        return
+    for tier in RISK_TIER_ORDER:
+        items = risk_ledger.get(tier) or []
+        if not items:
+            continue
+        items_html = "".join(f"<div>• {item}</div>" for item in items)
+        st.markdown(
+            f"<div class='risk-tier-card {_TIER_CSS[tier]}'>"
+            f"<div class='tier-label'>{_TIER_LABELS[tier]} ({len(items)})</div>{items_html}</div>",
+            unsafe_allow_html=True,
+        )
 
 
 def render_degradation_card(deg):
@@ -1072,7 +1456,72 @@ def render_status_ledger_banner(outcome):
     )
 
 
-def render_component_card(result):
+def render_provenance_expander(result):
+    """'Why this value?' traceability — only rendered when the model actually
+    supplied provenance metadata for this component; never fabricated."""
+    mat_prov = result.get("mat_provenance")
+    ut_prov = result.get("ut_provenance")
+    if not mat_prov and not ut_prov:
+        return
+    with st.expander("Why this value? (Data Provenance)"):
+        if mat_prov:
+            st.markdown("**Required Minimum MAT selection**")
+            if mat_prov.get("authority_tier"):
+                st.markdown(f"- Authority tier: *{mat_prov['authority_tier']}*")
+            if mat_prov.get("source"):
+                st.markdown(f"- Source: {mat_prov['source']}")
+            if mat_prov.get("general_criterion") is not None:
+                st.markdown(f"- General/default criterion overridden: {mat_prov['general_criterion']:.4f}")
+            if mat_prov.get("reason"):
+                st.markdown(f"- Why this value: {mat_prov['reason']}")
+        if ut_prov:
+            st.markdown("**Measured Minimum UT selection**")
+            if ut_prov.get("authority_tier"):
+                st.markdown(f"- Authority tier: *{ut_prov['authority_tier']}*")
+            if ut_prov.get("source"):
+                st.markdown(f"- Source: {ut_prov['source']}" + (f" ({ut_prov['source_date']})" if ut_prov.get("source_date") else ""))
+            if ut_prov.get("all_values_in_region"):
+                vals = ", ".join(f"{v:g}" for v in ut_prov["all_values_in_region"])
+                st.markdown(f"- All candidate values considered in this region: {vals}")
+            if ut_prov.get("reason"):
+                st.markdown(f"- Why this value: {ut_prov['reason']}")
+
+
+def render_audit_trail_expander(result, next_steps):
+    """End-to-end audit trail: Source Segment -> Extracted Raw Values ->
+    Applied Precedence Rule -> Calculation -> Risk Category -> Finding ->
+    Action Items, all drawn from data already computed elsewhere in this
+    file — nothing new is asserted here."""
+    summary = result.get("evaluation_summary") or {}
+    mat_prov = result.get("mat_provenance") or {}
+    ut_prov = result.get("ut_provenance") or {}
+    precedence_bits = []
+    if ut_prov.get("authority_tier"):
+        precedence_bits.append(f"UT reading: {ut_prov['authority_tier']}")
+    if mat_prov.get("authority_tier"):
+        precedence_bits.append(f"Criterion: {mat_prov['authority_tier']}")
+    precedence_text = "; ".join(precedence_bits) if precedence_bits else "No explicit source-precedence conflict was recorded for this component."
+
+    with st.expander("End-to-End Audit Trail"):
+        st.markdown(f"1. **Source Segment** — {result['name']}")
+        if result.get("mat") is not None and result.get("lowest"):
+            unit = f" {result['mat_unit']}" if result.get("mat_unit") else ""
+            lu = f" {result['lowest']['unit']}" if result['lowest'].get('unit') else ""
+            st.markdown(f"2. **Extracted Raw Values** — measured minimum {result['lowest']['value']:.4f}{lu}; stated/derived criterion {result['mat']:.4f}{unit}")
+        else:
+            st.markdown("2. **Extracted Raw Values** — insufficient data extracted to populate this step")
+        st.markdown(f"3. **Applied Precedence Rule** — {precedence_text}")
+        if result.get("margin") is not None:
+            st.markdown(f"4. **Calculation** — margin = measured − criterion = {result['margin']:+.4f}")
+        else:
+            st.markdown("4. **Calculation** — not computable from available data")
+        st.markdown(f"5. **Risk Category** — {summary.get('risk_category') or 'None (within spec)'}")
+        st.markdown(f"6. **Finding** — {summary.get('status_explanation', '')}")
+        steps_text = "; ".join(next_steps) if next_steps else "None required."
+        st.markdown(f"7. **Action Items** — {steps_text}")
+
+
+def render_component_card(result, extracted):
     status = result["status"]
     css_class = "blocked" if status == "blocked" else ("verified" if status == "verified" else "unresolved")
     pill_label = {
@@ -1082,6 +1531,7 @@ def render_component_card(result):
         "no_measurements": "No Data",
         "no_criteria_no_measurements": "Unverified",
     }[status]
+    summary = result.get("evaluation_summary") or {}
 
     st.markdown(
         f"<div class='glass-card component-card {css_class}'>"
@@ -1090,12 +1540,22 @@ def render_component_card(result):
         unsafe_allow_html=True,
     )
 
+    # Decoupled math-vs-workflow line: the mathematical calculation_result
+    # is never presented as if it were itself the workflow_status decision.
+    if summary:
+        st.markdown(
+            f"<div class='decoupled-status-line'>Calculation result: <b>{summary.get('calculation_result')}</b> "
+            f"&nbsp;|&nbsp; System workflow status: <b>{summary.get('workflow_status')}</b></div>",
+            unsafe_allow_html=True,
+        )
+
     # Multi-inspection historical trend — surfaced for every component that has
     # a comparable prior reading, regardless of current pass/fail status.
     deg = result.get("degradation")
     if deg and deg["is_loss"]:
         render_degradation_card(deg)
 
+    next_steps = []
     if status in ("blocked", "verified"):
         unit_suffix = f" {result['mat_unit']}" if result.get("mat_unit") else ""
         lowest = result["lowest"]
@@ -1124,10 +1584,17 @@ def render_component_card(result):
                 f"({result['mat']:.4f}{unit_suffix}) by {abs(result['margin']):.4f}.</div>",
                 unsafe_allow_html=True,
             )
-            steps_html = "".join(f"<li>{s}</li>" for s in remediation_steps(result["name"]))
+            next_steps = build_next_steps(result["name"], extracted)
+            gated_note = "" if has_governing_context(extracted) else (
+                "<div style='color:#FBBF24;font-size:0.78rem;margin-top:4px;'>Governing code, jurisdiction, "
+                "and/or metallurgy are not all on file — showing conservative generic next steps only, not a "
+                "specific code-level recommendation.</div>"
+            )
+            steps_html = "".join(f"<li>{s}</li>" for s in next_steps)
             st.markdown(
-                f"<div class='disposition-block'><div class='disposition-label'>Recommended Engineering Pathway — "
-                f"Awaiting Authorized Engineering/Inspector Review</div><ul>{steps_html}</ul>"
+                f"<div class='disposition-block'><div class='disposition-label'>Potential Next Steps for "
+                f"Authorized Engineer — Awaiting Authorized Engineering/Inspector Review</div><ul>{steps_html}</ul>"
+                f"{gated_note}"
                 f"<div style='color:#9CA3AF;font-size:0.8rem;'>This is a suggested exploration path, not a final "
                 f"disposition — the confirmed exceedance above stands independent of whichever pathway is ultimately "
                 f"authorized.</div></div>",
@@ -1137,13 +1604,19 @@ def render_component_card(result):
         st.write("Cannot compute a margin for this component — missing:")
         for m in result["missing_vars"]:
             st.markdown(f"- ❌ **{m}**")
+        next_steps = ["Supply the missing engineering variable(s) listed above.", "Route to an authorized engineer to confirm an interim basis if data cannot be obtained promptly."]
     elif status == "no_measurements":
         st.write("A minimum is on file for this component, but no UT readings were extracted for it.")
+        next_steps = ["Schedule a wall-thickness examination (UT) for this component.", "Confirm the stated minimum is still the applicable criterion before testing."]
     else:  # no_criteria_no_measurements
         st.warning(
             "No design acceptance criteria or wall-thickness examination metrics provided; "
             "structural condition is unverified."
         )
+        next_steps = ["Establish a design acceptance criterion for this component with engineering.", "Schedule a wall-thickness examination (UT) once criteria are established."]
+
+    render_provenance_expander(result)
+    render_audit_trail_expander(result, next_steps)
 
     with st.expander("View Raw Source Extraction Parameters Line"):
         st.json(result["raw"])
@@ -1190,30 +1663,32 @@ if uploaded is not None:
     parse_notices = st.session_state.get("parse_notices", [])
     outcome = evaluate(extracted)
     audit_notices = audit_extraction(report_text, extracted, parse_notices)
+    cm = outcome["confidence_metrics"]
 
-    score = extracted.get("extraction_confidence_score")
-    if score is None:
-        confidence_label = "Unknown"
-    elif score >= 0.85:
-        confidence_label = "High"
-    elif score >= 0.6:
-        confidence_label = "Medium"
-    else:
-        confidence_label = "Low"
-
-    # Pressure-excursion alert always sits at the very top of the matrix panel.
-    if outcome["pressure_excursion"]:
-        render_pressure_alert_banner(outcome["pressure_excursion"])
+    # Pressure-excursion alerts always sit at the very top of the matrix panel —
+    # one banner per distinct event; duplicates/continuations are folded in.
+    for pe in outcome["pressure_excursions"]:
+        if not pe["is_duplicate"]:
+            render_pressure_alert_banner(pe)
 
     st.markdown("#### Global Engineering Status Ledger")
     render_status_ledger_banner(outcome)
 
-    st.markdown("#### Dual Status Banners")
-    m1, m2 = st.columns(2)
-    m1.markdown(metric_html("Extraction Confidence (text legibility)", confidence_label, "accent-cyan"), unsafe_allow_html=True)
+    st.markdown("#### 5-Tier Risk Taxonomy Ledger")
+    render_risk_taxonomy_ledger(outcome["risk_ledger"])
+
+    st.markdown("#### Multi-Dimensional Confidence Metrics")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.markdown(metric_html("Text Extraction Confidence", cm["text_extraction_confidence"], "accent-cyan"), unsafe_allow_html=True)
+    m2.markdown(metric_html("Calculation Confidence", cm["calculation_confidence"], "accent-cyan"), unsafe_allow_html=True)
+    m3.markdown(metric_html("Source Conflict Level", cm["source_conflict_level"]), unsafe_allow_html=True)
+    m4.markdown(metric_html("Engineering Determination", cm["engineering_determination"]), unsafe_allow_html=True)
+    st.caption("Engineering Determination is always NOT_AVAILABLE — this system extracts, calculates, and flags; it never issues an independent engineering sign-off.")
+
+    st.markdown("#### Global Engineering Safety Status")
     gs = outcome["global_status"]
     gs_accent = "accent-gold" if gs == "BLOCKED" else None
-    m2.markdown(metric_html("Global Engineering Safety Status", gs, gs_accent), unsafe_allow_html=True)
+    st.markdown(metric_html("Workflow Status (system policy, not an engineering determination)", gs, gs_accent), unsafe_allow_html=True)
 
     if audit_notices:
         st.markdown("#### 🟡 System Extraction Audit Notice")
@@ -1228,15 +1703,18 @@ if uploaded is not None:
 
     with right:
         st.subheader("🧬 Live Structural Verification Matrix")
-        c1, c2, c3 = st.columns(3)
+        c1, c2, c3, c4 = st.columns(4)
         c1.markdown(metric_html("Asset Category", extracted.get("asset_category") or "Not stated"), unsafe_allow_html=True)
         c2.markdown(metric_html("Metallurgy", extracted.get("metallurgy_specification") or "Not stated"), unsafe_allow_html=True)
-        c3.markdown(metric_html("Engineering Framework", extracted.get("engineering_framework") or "Not determined"), unsafe_allow_html=True)
+        c3.markdown(metric_html("Governing Code", extracted.get("engineering_framework") or "Not determined"), unsafe_allow_html=True)
+        c4.markdown(metric_html("Jurisdiction", extracted.get("jurisdiction") or "Not stated"), unsafe_allow_html=True)
+        if not has_governing_context(extracted):
+            st.caption("Governing code, jurisdiction, and metallurgy are not all on file — code-specific recommendations are suppressed in favor of conservative generic next steps.")
 
         st.markdown("#### Calculation Trail Ledger")
-        st.caption("Component Name → Measured Minimum UT → Required Minimum MAT → Computed True Margin → Status → Recommended Engineering Pathway")
+        st.caption("Component Name → Measured Minimum UT → Required Minimum MAT → Computed True Margin → Calculation Result / Workflow Status → Potential Next Steps")
         for result in outcome["results"]:
-            render_component_card(result)
+            render_component_card(result, extracted)
 
         ledger = extracted.get("missing_engineering_variables_ledger") or []
         if ledger:
@@ -1244,14 +1722,16 @@ if uploaded is not None:
             for item in ledger:
                 st.markdown(f"- {item}")
 
-        anomalies = extracted.get("field_anomalies") or []
+        anomalies = outcome["field_anomalies"]
         if anomalies:
             st.markdown("#### ⚠️ Field Anomalies")
             for a in anomalies:
-                tag = "Confirmed Failure" if a.get("is_confirmed_failure") else "Unresolved — Requires Validation"
+                cat = a.get("risk_category") or "REQUIRES_VERIFICATION"
+                css = _TIER_CSS.get(cat, "unresolved")
+                label = _TIER_LABELS.get(cat, cat)
                 st.markdown(
                     f"<div class='glass-card'><b>{a.get('finding')}</b> "
-                    f"<span class='status-pill {'blocked' if a.get('is_confirmed_failure') else 'unresolved'}'>{tag}</span>"
+                    f"<span class='status-pill {'blocked' if cat == 'FAIL_BELOW_CRITERION' else 'unresolved'}'>{label}</span>"
                     f"<div style='color:#D1D5DB;margin-top:6px;'>{a.get('notes') or ''}</div></div>",
                     unsafe_allow_html=True,
                 )
