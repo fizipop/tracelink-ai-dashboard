@@ -608,7 +608,7 @@ if uploaded is not None:
     cache_key = f"{uploaded.name}:{len(raw_bytes)}:{hash(raw_bytes)}"
 
     if st.session_state.get("cache_key") != cache_key:
-        with st.spinner(f"Sending report to {MODEL_NAME} for structured extraction..."):
+        with st.spinner(f"Checking this amazing file"):
             try:
                 extracted = extract_with_claude(client, report_text)
                 st.session_state["extracted"] = extracted
