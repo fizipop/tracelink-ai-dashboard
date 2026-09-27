@@ -373,7 +373,12 @@ def get_client():
 FLAT_MANIFEST_FORMAT_SPEC = """\
 Component: <component name, exactly as named or clearly implied in the text>
 MAT: <numeric stated minimum, only if explicitly stated — omit this whole line if none is stated>
-Unit: <unit string, e.g. in, mm — omit this whole line if no unit is stated>
+Unit: <unit string, e.g. in, mm — MANDATORY whenever MAT or any UT/Historical_UT reading is stated for
+  this component. A bare number with no unit is not usable downstream, so if the text states a
+  component-specific minimum or reading but truly never states a unit anywhere near it, do not omit
+  this line silently — instead state the asset's global/document-wide unit if one is stated elsewhere
+  in the text (e.g. the report's header says all thicknesses are in inches), or, failing that, add a
+  MISSING_INFORMATION field_anomaly noting the value has no recoverable unit.>
 MAT_Authority_Tier: <one of the six source-precedence tiers below — omit if MAT is omitted>
 MAT_Source: <the specific document/section the minimum came from, e.g. "Design / Operating Information" — omit if unknown>
 MAT_General_Criterion: <numeric value of a general/default criterion this minimum overrides, if the text gives both a general and a special-case number — omit if not applicable>
@@ -395,6 +400,40 @@ Never invent a reading or a minimum that is not in the text. Every
 _Authority_Tier / _Source / _General_Criterion / _Reason line is optional
 provenance metadata — include it only when the text actually supports it;
 never fabricate a reason or a source document name.
+
+LABELING RULES THAT DRIVE DOWNSTREAM SAFETY LOGIC (label text is parsed
+by plain Python afterward — get these exact, since a mislabeled reading
+changes which calculation it feeds):
+  * ONE BLOCK PER PHYSICAL COMPONENT — NEVER SPLIT ACROSS TABLES. If the
+    same named component (e.g. "S3", "Shell Course 2") appears in more
+    than one table or section of the report — for example a current-cycle
+    UT table AND a separate prior-year/historical UT table — it still
+    gets exactly ONE "Component:" block. Put the current readings on the
+    UT: line and the prior-year readings on the Historical_UT: line of
+    THAT SAME block. Never emit two "Component: S3" blocks just because
+    the name appears in two different tables.
+  * PAD / REINFORCEMENT READINGS ARE NEVER MIXED INTO THE BASE-SHELL UT:
+    LINE. If a reading is explicitly taken on a repair pad, reinforcement
+    plate, doubler plate, or similar overlay rather than the original
+    parent-metal shell/wall, label that reading's location with a word
+    that says so (e.g. "S3_Pad=0.415", "Pad=0.415", "ReinforcementPlate
+    =0.415") so it is recognizable as a pad reading. A component with
+    both a base-shell reading and a pad reading over the same location
+    reports both — the base-shell reading on the UT: line under its own
+    plain location label (e.g. "S3=0.368") and the pad reading under a
+    label containing "Pad"/"Reinforcement"/"Plate"/"Doubler". Never let a
+    pad reading raise, lower, or replace the base-shell reading for that
+    location.
+  * PRE-PREP VS. POST-PREP READINGS. If the text records a reading taken
+    before surface preparation (grinding/cleaning/blasting) and a second
+    reading taken after surface preparation at the same location, label
+    each with a location that says which is which (e.g. "S7_PrePrep
+    =9.48", "S7_PostPrep=9.55" — "Pre-Prep"/"Post-Prep",
+    "As-Found"/"As-Left", or "Before-Prep"/"After-Prep" are all
+    acceptable, but always include one of those words). Never report only
+    the post-prep number and silently drop the pre-prep number, and never
+    merge the two into a single averaged or "best" value — both must
+    appear as separate entries on the UT: line.
 
 SOURCE PRECEDENCE TIERS (highest authority first — use these exact strings
 for any _Authority_Tier line, and never let a lower tier silently overwrite
@@ -456,6 +495,18 @@ Read the raw inspection text the user provides and call the \
   both sources in the "notes" field, and still select the higher of the two \
   values as a conservative placeholder in the manifest so downstream \
   calculations do not silently under-report risk.
+- "global_minimum_allowable_thickness" is an asset-level (not per-component) \
+  minimum thickness the text states applies to the whole vessel/asset by \
+  default — e.g. a header or design-basis line reading "Minimum Allowable \
+  Shell Thickness (MAT): 0.375 in". Extract it only when the text states it \
+  as a document-wide default, with both value and unit; null if no such \
+  document-wide default is stated. This is separate from any per-component \
+  MAT: line in the flat manifest — a component's own explicitly stated \
+  minimum (its own MAT: line) always takes precedence over this document-wide \
+  default; this field exists purely so a component the text never gives its \
+  own explicit minimum can still be evaluated against the stated document-wide \
+  default rather than falling through to MISSING_INFORMATION. Never invent \
+  this value if the text gives no document-wide default at all.
 - "engineering_framework" is the applicable governing code if the text \
   states or clearly implies one (e.g. "ASME Sec VIII", "ASME B31.3", \
   "AWS D1.1", "API 653"); null if not determinable. "jurisdiction" is the \
@@ -561,6 +612,19 @@ EXTRACTION_TOOL = {
                     "text_extraction_confidence": {"type": ["string", "null"], "enum": ["HIGH", "MEDIUM", "LOW", None]},
                     "calculation_confidence": {"type": ["string", "null"], "enum": ["HIGH", "MEDIUM", "LOW", None]},
                     "source_conflict_level": {"type": ["string", "null"], "enum": ["NONE", "LOW", "MEDIUM", "HIGH", None]},
+                },
+            },
+            "global_minimum_allowable_thickness": {
+                "type": ["object", "null"],
+                "description": (
+                    "Asset-level (document-wide) minimum allowable thickness, e.g. 'Minimum Allowable "
+                    "Shell Thickness (MAT)', only if the text states one as a default applying to the "
+                    "whole asset rather than to one specific component. Automatically propagates into "
+                    "any component whose own per-component MAT is not separately stated."
+                ),
+                "properties": {
+                    "value": {"type": ["number", "null"]},
+                    "unit": {"type": ["string", "null"]},
                 },
             },
             "piping_design_variables": {
@@ -726,6 +790,42 @@ def extract_with_claude(client, report_text):
 
 _NUMERIC_RE = re.compile(r"[-+]?\d*\.?\d+")
 
+# Shared label-classification vocabularies used by BOTH the primary
+# flat-manifest parser and the fallback table reparser, so a reading is
+# classified the same way regardless of which pass recovered it.
+NON_BOUNDARY_LABEL_HINTS = ("plate", "pad", "reinforcement", "repair", "doubler")
+PRE_PREP_LABEL_HINTS = ("pre-prep", "pre prep", "preprep", "as-found", "asfound", "before-prep", "beforeprep", "pre_prep")
+POST_PREP_LABEL_HINTS = ("post-prep", "post prep", "postprep", "as-left", "asleft", "after-prep", "afterprep", "post_prep")
+
+
+def _label_matches(label, hints):
+    if not label:
+        return False
+    low = label.lower()
+    return any(h in low for h in hints)
+
+
+def _resolve_unit(explicit_unit, global_unit, notices, context_label):
+    """Enforces the value/unit pairing rule: a numeric value is never left
+    paired with a NULL unit if any unit is recoverable. Falls back to the
+    document-wide global MAT unit (when available) and only returns None,
+    with a visible notice, when truly nothing is recoverable — so a bare,
+    un-unitized number is always surfaced as a flagged gap rather than
+    silently treated as usable."""
+    if explicit_unit:
+        return explicit_unit
+    if global_unit:
+        notices.append(
+            f"{context_label}: no unit was stated alongside this value — used the document-wide "
+            f"global MAT unit ('{global_unit}') as a fallback."
+        )
+        return global_unit
+    notices.append(
+        f"{context_label}: a numeric value was stated with no recoverable unit anywhere in the "
+        "document — flagged as unusable pending verification rather than silently treated as valid."
+    )
+    return None
+
 
 def _coerce_float(raw_value):
     """Pulls the first numeric token out of a string; returns None if there
@@ -760,8 +860,28 @@ def _parse_reading_list(line_value, fallback_unit):
         value = _coerce_float(value_str)
         if value is None:
             continue  # skip unparseable tokens rather than fabricate a reading
-        readings.append({"location_label": label, "value": value, "unit": fallback_unit})
+        if _label_matches(label, PRE_PREP_LABEL_HINTS):
+            prep_phase = "pre"
+        elif _label_matches(label, POST_PREP_LABEL_HINTS):
+            prep_phase = "post"
+        else:
+            prep_phase = None
+        readings.append({"location_label": label, "value": value, "unit": fallback_unit, "prep_phase": prep_phase})
     return readings
+
+
+def _split_non_boundary_readings(readings):
+    """Splits a parsed reading list into (shell_readings, pad_readings) by
+    checking each reading's own location label against the shared
+    NON_BOUNDARY_LABEL_HINTS vocabulary (pad/reinforcement/plate/doubler/
+    repair). A pad/reinforcement reading is evaluated separately from the
+    original parent-metal shell — per API 570, a repair pad passing does
+    not offset a base-shell exceedance at the same location, so the two
+    must never be blended into one 'lowest reading' comparison."""
+    shell, pad = [], []
+    for r in readings:
+        (pad if _label_matches(r.get("location_label"), NON_BOUNDARY_LABEL_HINTS) else shell).append(r)
+    return shell, pad
 
 
 def _parse_float_list(line_value):
@@ -794,11 +914,22 @@ _PROVENANCE_LINE_MAP = {
 }
 
 
-def _parse_single_component_block(block_text):
+def _parse_single_component_block(block_text, global_mat=None, notices=None):
     """Parses one 'Component: ... ' block (already stripped of its trailing
     Component_End marker) into the component dict shape evaluate_component()
     expects, including optional decision-traceability metadata. Returns None
-    if the block has no recognizable component name."""
+    if the block has no recognizable component name.
+
+    global_mat, when provided, is the {"value", "unit"} dict extracted from
+    the document-wide "global_minimum_allowable_thickness" field. It is
+    propagated into this component's explicit_minimum_required_mat ONLY
+    when the component states no MAT of its own — a component's own stated
+    minimum always wins.
+
+    notices, when provided, collects human-readable strings for unit-
+    fallback and pad-isolation events, surfaced later as parse notices."""
+    if notices is None:
+        notices = []
     component_name = None
     mat_value = None
     mat_unit = None
@@ -837,11 +968,70 @@ def _parse_single_component_block(block_text):
     if not component_name:
         return None
 
-    ut_readings = _parse_reading_list(ut_line_value, mat_unit)
+    global_unit = (global_mat or {}).get("unit")
+
+    # Mandatory unit-pairing rule: a stated MAT value is never left with a
+    # NULL unit if any unit is recoverable anywhere in the document.
+    if mat_value is not None:
+        mat_unit = _resolve_unit(mat_unit, global_unit, notices, f"'{component_name}' MAT value")
+
+    ut_readings_all = _parse_reading_list(ut_line_value, mat_unit)
     historical_readings = _parse_reading_list(historical_line_value, mat_unit)
 
+    # Belt-and-suspenders unit backstop: a reading can still come out with
+    # unit=None here if this block stated readings but no "Unit:" line at
+    # all (e.g. a historical-only block later merged into a component whose
+    # current-cycle block carried the unit). Never leave a parsed reading
+    # value paired with a NULL unit if the document-wide global unit can
+    # fill the gap.
+    if global_unit:
+        for reading in ut_readings_all + historical_readings:
+            if reading.get("value") is not None and not reading.get("unit"):
+                reading["unit"] = global_unit
+                notices.append(
+                    f"'{component_name}' reading '{reading['location_label']}' stated no unit of its "
+                    f"own — used the document-wide global MAT unit ('{global_unit}') as a fallback."
+                )
+    else:
+        for reading in ut_readings_all + historical_readings:
+            if reading.get("value") is not None and not reading.get("unit"):
+                notices.append(
+                    f"'{component_name}' reading '{reading['location_label']}' has no recoverable unit "
+                    "anywhere in the document — flagged as unusable pending verification."
+                )
+
+    # Pad/reinforcement readings are never blended into the base-shell
+    # reading list that margin calculations use — isolate them here so a
+    # passing pad reading can never mask a failing base-shell reading (and
+    # vice versa) at the same location.
+    ut_readings, pad_readings = _split_non_boundary_readings(ut_readings_all)
+    if pad_readings:
+        notices.append(
+            f"'{component_name}': isolated {len(pad_readings)} reinforcement/repair-pad reading(s) "
+            "from the base-shell UT readings — evaluated separately per API 570."
+        )
+
+    # Global MAT propagation: only fires when this component stated no MAT
+    # of its own. A component's own explicit MAT/Unit lines always win.
+    mat_propagated_from_global = False
+    if mat_value is None and global_mat and global_mat.get("value") is not None:
+        mat_value = global_mat.get("value")
+        mat_unit = global_mat.get("unit")
+        mat_propagated_from_global = True
+        notices.append(
+            f"'{component_name}': no per-component MAT was stated — propagated the document-wide "
+            f"global MAT ({mat_value} {mat_unit or ''}).".strip()
+        )
+
     mat_provenance = None
-    if any(k in provenance_raw for k in ("mat_authority_tier", "mat_source", "mat_general_criterion", "mat_reason")):
+    if mat_propagated_from_global:
+        mat_provenance = {
+            "authority_tier": None,
+            "source": "Document-wide global MAT (propagated — no per-component minimum stated)",
+            "general_criterion": None,
+            "reason": "This component stated no minimum of its own; the document-wide global MAT was applied.",
+        }
+    elif any(k in provenance_raw for k in ("mat_authority_tier", "mat_source", "mat_general_criterion", "mat_reason")):
         mat_provenance = {
             "authority_tier": provenance_raw.get("mat_authority_tier"),
             "source": provenance_raw.get("mat_source"),
@@ -868,10 +1058,53 @@ def _parse_single_component_block(block_text):
         "ut_provenance": ut_provenance,
         "ut_thickness_measurements": ut_readings,
         "historical_ut_thickness_measurements": historical_readings,
+        "non_pressure_boundary_measurements": pad_readings,
     }
 
 
-def native_parameter_matrix_parser(manifest_text, raw_report):
+def _merge_duplicate_components(components, notices):
+    """Relational-linking safety net: merges component dicts that share the
+    same normalized component_name into a single entry, appending readings
+    rather than creating duplicate component IDs. This is the fix for the
+    ingestion failure mode where the same physical component (e.g. 'S3')
+    appears once in a current-cycle UT table and again in a separate
+    prior-year/historical table, and would otherwise become two component
+    entries instead of one entry with both current and historical readings.
+
+    Order of first appearance is preserved. When more than one merged block
+    states its own explicit MAT, the first non-null one is kept (a real
+    conflict here would already have been visible to the model as duplicate
+    per-component MAT lines — this function does not attempt to adjudicate
+    that, only to stop duplicate component IDs from being created)."""
+    merged_by_key = {}
+    order = []
+    for comp in components:
+        key = (comp.get("component_name") or "").strip().lower()
+        if not key:
+            order.append(comp)
+            continue
+        if key not in merged_by_key:
+            merged_by_key[key] = comp
+            order.append(comp)
+            continue
+        existing = merged_by_key[key]
+        existing["ut_thickness_measurements"] = (existing.get("ut_thickness_measurements") or []) + (comp.get("ut_thickness_measurements") or [])
+        existing["historical_ut_thickness_measurements"] = (existing.get("historical_ut_thickness_measurements") or []) + (comp.get("historical_ut_thickness_measurements") or [])
+        existing["non_pressure_boundary_measurements"] = (existing.get("non_pressure_boundary_measurements") or []) + (comp.get("non_pressure_boundary_measurements") or [])
+        if not existing.get("explicit_minimum_required_mat") and comp.get("explicit_minimum_required_mat"):
+            existing["explicit_minimum_required_mat"] = comp["explicit_minimum_required_mat"]
+            existing["mat_provenance"] = comp.get("mat_provenance")
+        if not existing.get("ut_provenance") and comp.get("ut_provenance"):
+            existing["ut_provenance"] = comp.get("ut_provenance")
+        notices.append(
+            f"Relational linking: merged a duplicate '{comp.get('component_name')}' block into the "
+            "existing component entry instead of creating a second component ID (likely the same "
+            "physical component appearing in both a current-cycle and a historical/prior-year table)."
+        )
+    return order
+
+
+def native_parameter_matrix_parser(manifest_text, raw_report, global_mat=None):
     """Splits the model's flat_manifest_block on its own explicit boundary
     markers and rebuilds the per-component matrix in plain Python. This is
     the piece of the pipeline that is immune to the model dropping or
@@ -883,6 +1116,11 @@ def native_parameter_matrix_parser(manifest_text, raw_report):
     `raw_report` is accepted (and currently unused directly) so this
     function's signature matches callers that want to cross-reference the
     original text in future audit passes without changing the call site.
+
+    `global_mat` is the document-wide {"value", "unit"} dict (from the
+    model's "global_minimum_allowable_thickness" field, if any) — propagated
+    into any component that states no MAT of its own, and used as the unit
+    fallback for a component that states a MAT value but no unit.
 
     Returns: (components: list[dict], parse_notices: list[str])
     """
@@ -911,7 +1149,7 @@ def native_parameter_matrix_parser(manifest_text, raw_report):
         if "component:" not in block.lower():
             continue
         try:
-            parsed = _parse_single_component_block(block)
+            parsed = _parse_single_component_block(block, global_mat=global_mat, notices=notices)
         except Exception as e:  # defensive: one bad block must not blank the matrix
             parsed = None
             notices.append(f"Skipped an unparseable component block during flat-manifest parsing: {e}")
@@ -927,7 +1165,7 @@ def native_parameter_matrix_parser(manifest_text, raw_report):
             "still parsed on a best-effort basis if a name and any fields were recoverable."
         )
         try:
-            parsed = _parse_single_component_block(trailing.strip())
+            parsed = _parse_single_component_block(trailing.strip(), global_mat=global_mat, notices=notices)
             if parsed is not None:
                 components_out.append(parsed)
         except Exception:
@@ -938,6 +1176,11 @@ def native_parameter_matrix_parser(manifest_text, raw_report):
             "No components could be parsed out of a non-empty flat_manifest_block — check the raw "
             "block in the debug expander below; the manifest may not follow the expected grammar."
         )
+
+    # Relational-linking safety net: collapse duplicate component blocks
+    # (same name appearing once per table it was mentioned in) into single
+    # entries before this matrix ever reaches evaluation.
+    components_out = _merge_duplicate_components(components_out, notices)
 
     return components_out, notices
 
@@ -1007,20 +1250,32 @@ def _normalize_confidence(text):
 
 
 _INCHES_TOKEN_RE = re.compile(r'\bin(?:ches)?\b|"', re.IGNORECASE)
+_MM_TOKEN_RE = re.compile(r'\bmm\b|\bmillimet(?:er|re)s?\b', re.IGNORECASE)
 
 
-def _fallback_numbers_from(col_indices, cells, header_cells):
+def _fallback_numbers_from(col_indices, cells, header_cells, default_unit=None, notices=None):
     """Pulls every decimal/integer token out of each named column, labeling
     each with its column header (plus a numbered suffix if a single cell
     contains more than one number, e.g. 'Initial 10.9 / Repeat 11.0').
 
-    Generic unit handling: if the cell text itself or its column header
-    contains an inches marker ("in", "inches", or a bare double-quote —
-    e.g. a cell reading '0.39 in'), the extracted number is treated as
-    inches and converted to millimeters (x25.4) before being returned, with
-    a conversion_note recording the original value/unit so nothing is
-    silently rewritten. A cell with no unit marker at all is left exactly
-    as extracted — this never guesses a unit that wasn't stated."""
+    Unit handling — a value returned from this function is NEVER paired
+    with a NULL unit:
+      1. If the cell text or its column header contains an inches marker
+         ("in", "inches", or a bare double-quote), the number is treated as
+         inches and converted to millimeters (x25.4), with a conversion_note
+         recording the original value/unit so nothing is silently rewritten.
+      2. Else if the cell text or header explicitly says "mm"/"millimeter(s)",
+         the number is kept as-is with unit "mm".
+      3. Else, if a default_unit was supplied (typically the document-wide
+         global MAT unit, or a unit already established elsewhere in the
+         same report), that unit is used and a notice is recorded so the
+         fallback is visible rather than silent.
+      4. Only if none of the above apply is a reading returned with
+         unit=None, and a notice is always appended for that case flagging
+         it as unusable pending verification — this function never resolves
+         that case by guessing a unit with no textual basis."""
+    if notices is None:
+        notices = []
     out = []
     for i in col_indices:
         if i >= len(cells):
@@ -1028,6 +1283,7 @@ def _fallback_numbers_from(col_indices, cells, header_cells):
         cell_text = cells[i]
         header_text = header_cells[i] if i < len(header_cells) else ""
         is_inches = bool(_INCHES_TOKEN_RE.search(cell_text) or _INCHES_TOKEN_RE.search(header_text))
+        is_mm = bool(_MM_TOKEN_RE.search(cell_text) or _MM_TOKEN_RE.search(header_text))
         tokens = re.findall(r"-?\d+\.?\d*", cell_text)
         base_label = header_text.strip() if header_text.strip() else f"col{i}"
         for j, tok in enumerate(tokens):
@@ -1036,17 +1292,32 @@ def _fallback_numbers_from(col_indices, cells, header_cells):
                 continue
             conversion_note = None
             unit = None
+            label = base_label if len(tokens) == 1 else f"{base_label}_{j + 1}"
             if is_inches:
                 converted = round(val * 25.4, 4)
                 conversion_note = f"Converted from {val:g} in to {converted:g} mm (x25.4)."
                 val = converted
                 unit = "mm"
-            label = base_label if len(tokens) == 1 else f"{base_label}_{j + 1}"
+            elif is_mm:
+                unit = "mm"
+            elif default_unit:
+                unit = default_unit
+                notices.append(
+                    f"Fallback reparse: column '{base_label}' cell '{cell_text}' stated no unit — "
+                    f"used the document-wide default unit ('{default_unit}') rather than leaving it "
+                    "un-unitized."
+                )
+            else:
+                notices.append(
+                    f"Fallback reparse: column '{base_label}' cell '{cell_text}' stated no unit and no "
+                    "document-wide default unit is available — flagged as unusable pending verification "
+                    "rather than treated as a valid measurement."
+                )
             out.append({"location_label": label, "value": val, "unit": unit, "conversion_note": conversion_note})
     return out
 
 
-def execute_fallback_reparse(raw_report):
+def execute_fallback_reparse(raw_report, global_mat=None):
     """Secondary, plain-Python recovery parser. Scans the raw report's own
     Markdown-style pipe tables directly — using each table's own header row
     to decide which column is a location/component label, which columns are
@@ -1126,24 +1397,41 @@ def execute_fallback_reparse(raw_report):
                 if ci < len(cells):
                     confidence_value = _normalize_confidence(cells[ci]) or confidence_value
 
-            non_boundary_readings = _fallback_numbers_from(non_boundary_cols, cells, header_cells)
+            default_unit = (global_mat or {}).get("unit")
+            non_boundary_readings = _fallback_numbers_from(non_boundary_cols, cells, header_cells, default_unit, notices)
             if row_is_non_boundary:
-                non_boundary_readings += _fallback_numbers_from(reading_cols, cells, header_cells)
+                non_boundary_readings += _fallback_numbers_from(reading_cols, cells, header_cells, default_unit, notices)
                 ut_readings = []
             else:
-                ut_readings = _fallback_numbers_from(reading_cols, cells, header_cells)
-            historical_readings = _fallback_numbers_from(hist_cols, cells, header_cells)
-            mat_values = _fallback_numbers_from(min_cols, cells, header_cells)
+                ut_readings = _fallback_numbers_from(reading_cols, cells, header_cells, default_unit, notices)
+            historical_readings = _fallback_numbers_from(hist_cols, cells, header_cells, default_unit, notices)
+            mat_values = _fallback_numbers_from(min_cols, cells, header_cells, default_unit, notices)
 
             if not ut_readings and not historical_readings and not mat_values and not non_boundary_readings:
                 continue  # this row carried no recoverable numeric data at all
 
+            mat_provenance = None
+            if mat_values:
+                explicit_minimum_required_mat = {"value": mat_values[0]["value"], "unit": mat_values[0]["unit"]}
+            elif global_mat and global_mat.get("value") is not None:
+                explicit_minimum_required_mat = {"value": global_mat.get("value"), "unit": global_mat.get("unit")}
+                mat_provenance = {
+                    "authority_tier": None,
+                    "source": "Document-wide global MAT (propagated — no per-component minimum stated)",
+                    "general_criterion": None,
+                    "reason": "This component stated no minimum of its own; the document-wide global MAT was applied.",
+                }
+                notices.append(
+                    f"'{component_name}': no per-component MAT column value found — propagated the "
+                    f"document-wide global MAT ({global_mat.get('value')} {global_mat.get('unit') or ''}).".strip()
+                )
+            else:
+                explicit_minimum_required_mat = None
+
             components.append({
                 "component_name": component_name,
-                "explicit_minimum_required_mat": (
-                    {"value": mat_values[0]["value"], "unit": mat_values[0]["unit"]} if mat_values else None
-                ),
-                "mat_provenance": None,
+                "explicit_minimum_required_mat": explicit_minimum_required_mat,
+                "mat_provenance": mat_provenance,
                 "ut_provenance": {
                     "authority_tier": "Supplemental UT Measurement",
                     "source": None,
@@ -1161,6 +1449,12 @@ def execute_fallback_reparse(raw_report):
                 "measurement_confidence": confidence_value,
                 "fallback_extracted": True,
             })
+
+    # Relational-linking safety net: the same component label commonly
+    # appears in both a current-cycle table and a separate historical/
+    # prior-year table in the raw report — merge those into one component
+    # entry rather than leaving duplicate component IDs.
+    components = _merge_duplicate_components(components, notices)
 
     if components:
         notices.append(
@@ -1231,7 +1525,8 @@ def compute_degradation(component):
 
 
 def build_evaluation_summary(status, name, lowest=None, mat=None, mat_unit=None, margin=None,
-                              via_fallback=False, low_confidence=False):
+                              via_fallback=False, low_confidence=False, pad_flag=False,
+                              pre_reading=None, post_reading=None):
     """Decouples the mathematical calculation result from the system's
     workflow status, per the requirement that a workflow label (BLOCKED,
     etc.) must never be presented as if it were itself an engineering
@@ -1263,13 +1558,32 @@ def build_evaluation_summary(status, name, lowest=None, mat=None, mat_unit=None,
             f" This reading was {' and '.join(cause)} — the BLOCKED status is retained regardless, "
             "since a confirmed exceedance is never softened on the strength of a lower-confidence read."
         ) if cause else ""
+        pad_note = (
+            " A reinforcement/repair pad reading is also on file for this location, evaluated "
+            "separately per API 570 — the pad reading does not offset this base-shell exceedance, and "
+            "a separate engineering assessment of the pad under API 570 is required."
+        ) if pad_flag else ""
         status_explanation = (
             f"Mathematical result is BELOW_PROVIDED_MINIMUM ({name} measured {lowest['value']:.4f}{unit} "
             f"vs. {mat:.4f}{unit} required minimum, margin {margin:+.4f}). System workflow set to BLOCKED "
             f"per safety policy — this is a workflow decision, not itself an engineering disposition."
-            f"{fallback_note}"
+            f"{fallback_note}{pad_note}"
         )
         risk_category = "FAIL_BELOW_CRITERION"
+    elif status == "requires_verification_prep":
+        unit = f" {mat_unit}" if mat_unit else ""
+        calculation_result = "REQUIRES_VERIFICATION_SURFACE_PREP_RETEST"
+        workflow_status = "REQUIRES_VERIFICATION"
+        status_explanation = (
+            f"{name}: the pre-surface-prep reading ({pre_reading['location_label']}="
+            f"{pre_reading['value']:.4f}{unit}) fell below the required minimum ({mat:.4f}{unit}), but "
+            f"the post-surface-prep reading ({post_reading['location_label']}={post_reading['value']:.4f}"
+            f"{unit}) is at or above it. This is neither auto-passed nor auto-failed: a human reviewer "
+            "must confirm whether the pre-prep reading reflected surface scale/coating removed by "
+            "prep (in which case the post-prep reading governs) or a return to base-metal at a "
+            "thinner point (in which case it does not) before this location can be cleared."
+        )
+        risk_category = "REQUIRES_VERIFICATION"
     elif status == "verified":
         unit = f" {mat_unit}" if mat_unit else ""
         if unconfirmed:
@@ -1355,19 +1669,46 @@ def evaluate_component(component, is_piping, piping_vars):
                      "ut_provenance": ut_provenance, "degradation": degradation,
                      "evaluation_summary": evaluation_summary, "raw": component}
 
+    non_boundary_readings = component.get("non_pressure_boundary_measurements") or []
+    via_fallback = bool(component.get("fallback_extracted"))
+    low_confidence = (component.get("measurement_confidence") or "").upper() == "LOW"
+
+    # Surface-prep re-test workflow: a component whose current readings
+    # include BOTH a pre-prep and a post-prep sample for the same visit is
+    # never silently auto-passed (on the post-prep number) or auto-failed
+    # (on the pre-prep number). Only when the pre-prep reading is genuinely
+    # below MAT and the post-prep reading clears it does this override fire
+    # — otherwise (e.g. both fail, or both pass) the normal lowest-reading
+    # comparison below already gives the right, conservative answer.
+    pre_readings = [r for r in ut_list if r.get("prep_phase") == "pre"]
+    post_readings = [r for r in ut_list if r.get("prep_phase") == "post"]
+    if pre_readings and post_readings:
+        lowest_pre = min(pre_readings, key=lambda r: r["value"])
+        lowest_post = min(post_readings, key=lambda r: r["value"])
+        if lowest_pre["value"] < mat <= lowest_post["value"]:
+            evaluation_summary = build_evaluation_summary(
+                "requires_verification_prep", name, mat=mat, mat_unit=mat_unit,
+                pre_reading=lowest_pre, post_reading=lowest_post,
+            )
+            return {"name": name, "status": "requires_verification_prep", "mat": mat, "mat_unit": mat_unit,
+                     "lowest": lowest_pre, "pre_reading": lowest_pre, "post_reading": lowest_post,
+                     "mat_provenance": mat_provenance, "ut_provenance": ut_provenance,
+                     "degradation": degradation, "via_fallback": via_fallback, "low_confidence": low_confidence,
+                     "non_boundary_readings": non_boundary_readings,
+                     "evaluation_summary": evaluation_summary, "raw": component}
+
     lowest = min(ut_list, key=lambda r: r["value"])
     margin = round(lowest["value"] - mat, 4)
     status = "blocked" if margin < 0 else "verified"
-    via_fallback = bool(component.get("fallback_extracted"))
-    low_confidence = (component.get("measurement_confidence") or "").upper() == "LOW"
+    pad_flag = status == "blocked" and bool(non_boundary_readings)
     evaluation_summary = build_evaluation_summary(status, name, lowest=lowest, mat=mat, mat_unit=mat_unit,
                                                      margin=margin, via_fallback=via_fallback,
-                                                     low_confidence=low_confidence)
+                                                     low_confidence=low_confidence, pad_flag=pad_flag)
     return {"name": name, "status": status, "mat": mat, "mat_unit": mat_unit, "lowest": lowest,
              "margin": margin, "calc_note": calc_note, "mat_provenance": mat_provenance,
              "ut_provenance": ut_provenance, "degradation": degradation, "via_fallback": via_fallback,
-             "low_confidence": low_confidence,
-             "non_boundary_readings": component.get("non_pressure_boundary_measurements") or [],
+             "low_confidence": low_confidence, "pad_flag": pad_flag,
+             "non_boundary_readings": non_boundary_readings,
              "evaluation_summary": evaluation_summary, "raw": component}
 
 
@@ -1488,6 +1829,15 @@ def build_risk_ledger(results, field_anomalies, pressure_excursions, ledger_item
                 f"{r['name']}: measured {r['lowest']['value']:.4f}{unit} vs. required "
                 f"{r['mat']:.4f}{unit} (margin {r['margin']:+.4f})"
             )
+            if r.get("pad_flag"):
+                entries["REQUIRES_VERIFICATION"].append(
+                    f"{r['name']}: base-shell reading is below the required minimum independent of the "
+                    "on-file reinforcement/repair pad reading at this location — an engineering "
+                    "assessment of the pad per API 570 is required in addition to the base-shell "
+                    "exceedance above."
+                )
+        elif r["status"] == "requires_verification_prep":
+            entries["REQUIRES_VERIFICATION"].append(r["evaluation_summary"]["status_explanation"])
         elif cat == "MISSING_INFORMATION":
             if r["status"] == "no_criteria_no_measurements":
                 entries[cat].append(f"{r['name']}: no design acceptance criteria or wall-thickness examination metrics provided")
@@ -1551,7 +1901,7 @@ def evaluate(extracted):
 
     results = [evaluate_component(c, is_piping, piping_vars) for c in components]
     blocked = [r for r in results if r["status"] == "blocked"]
-    unresolved = [r for r in results if r["status"] in ("insufficient", "no_measurements", "no_criteria_no_measurements")]
+    unresolved = [r for r in results if r["status"] in ("insufficient", "no_measurements", "no_criteria_no_measurements", "requires_verification_prep")]
     degradations = [r["degradation"] for r in results if r.get("degradation") and r["degradation"]["is_loss"]]
     field_anomalies = extracted.get("field_anomalies") or []
     ledger_items = extracted.get("missing_engineering_variables_ledger") or []
@@ -1911,6 +2261,7 @@ def render_component_card(result, extracted):
         "insufficient": "Unresolved",
         "no_measurements": "No Data",
         "no_criteria_no_measurements": "Unverified",
+        "requires_verification_prep": "Requires Verification (Surface Prep)",
     }[status]
     summary = result.get("evaluation_summary") or {}
 
@@ -1930,6 +2281,20 @@ def render_component_card(result, extracted):
         st.caption(
             "🔎 Source text tags this reading LOW measurement confidence — not treated as a "
             "definitive pass even where the computed margin is positive."
+        )
+    if result.get("pad_flag"):
+        st.caption(
+            "🛠️ Base-shell exceedance confirmed independent of an on-file reinforcement/repair pad "
+            "reading at this location — a separate API 570 engineering assessment of the pad is "
+            "required in addition to the shell finding."
+        )
+    if status == "requires_verification_prep":
+        unit = f" {result.get('mat_unit')}" if result.get("mat_unit") else ""
+        pre_r, post_r = result["pre_reading"], result["post_reading"]
+        st.caption(
+            f"🧽 Pre-prep reading {pre_r['location_label']}={pre_r['value']:.4f}{unit} was below the "
+            f"required minimum; post-prep reading {post_r['location_label']}={post_r['value']:.4f}{unit} "
+            "clears it. Routed to human review rather than auto-passed or auto-failed."
         )
     non_boundary = result.get("non_boundary_readings") or []
     if non_boundary:
@@ -2044,7 +2409,8 @@ if uploaded is not None:
             try:
                 extracted = extract_with_claude(client, report_text)
                 manifest_text = extracted.get("flat_manifest_block", "")
-                components_matrix, parse_notices = native_parameter_matrix_parser(manifest_text, report_text)
+                global_mat = extracted.get("global_minimum_allowable_thickness")
+                components_matrix, parse_notices = native_parameter_matrix_parser(manifest_text, report_text, global_mat=global_mat)
 
                 # Automatic Fallback Pipeline Controller: only fires on the specific failure
                 # mode this stage exists for — the model's own self-assessment says the text
@@ -2058,7 +2424,7 @@ if uploaded is not None:
                     and len(components_matrix) == 0
                     and raw_text_has_components_or_tables(report_text)
                 ):
-                    fallback_components, fallback_notices = execute_fallback_reparse(report_text)
+                    fallback_components, fallback_notices = execute_fallback_reparse(report_text, global_mat=global_mat)
                     components_matrix = fallback_components
                     parse_notices = list(parse_notices) + fallback_notices
 
@@ -2127,6 +2493,12 @@ if uploaded is not None:
         c4.markdown(metric_html("Jurisdiction", extracted.get("jurisdiction") or "Not stated"), unsafe_allow_html=True)
         if not has_governing_context(extracted):
             st.caption("Governing code, jurisdiction, and metallurgy are not all on file — code-specific recommendations are suppressed in favor of conservative generic next steps.")
+        gmat = extracted.get("global_minimum_allowable_thickness") or {}
+        if gmat.get("value") is not None:
+            st.caption(
+                f"📐 Document-wide global MAT on file: {gmat['value']:g} {gmat.get('unit') or ''} — "
+                "propagated into any component below that states no minimum of its own."
+            )
 
         st.markdown("#### Calculation Trail Ledger")
         st.caption("Component Name → Measured Minimum UT → Required Minimum MAT → Computed True Margin → Calculation Result / Workflow Status → Potential Next Steps")
