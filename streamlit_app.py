@@ -136,7 +136,7 @@ def extract_with_claude(client, report_text):
     the SDK hands back an already-parsed Python dict — no JSON.loads /
     fence-stripping needed on our side."""
     response = client.messages.create(
-        model="claude-sonnet-5",
+        model=claude-sonnet-5,
         max_tokens=2000,
         system=SYSTEM_PROMPT,
         tools=[EXTRACTION_TOOL],
