@@ -526,7 +526,7 @@ def extract_with_claude(client, report_text):
         tools=[EXTRACTION_TOOL],
         # FORCED MANDATE: locks the model into calling extract_compliance_data
         # — it cannot reply with plain text on this turn.
-        tool_choice={"type": "tool", "name": "extract_compliance_data"},
+        tool_choice={"type": "auto"},
         messages=[{"role": "user", "content": report_text}],
     )
     for block in response.content:
