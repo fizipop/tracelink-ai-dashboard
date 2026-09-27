@@ -23,7 +23,10 @@ has been retired on the Claude API. This uses the current comparable
 model, `claude-sonnet-5` — change MODEL_NAME below if your account
 should target a different one.
 """
-
+import os
+import json
+import streamlit as st
+import anthropic
 import sys
 import subprocess
 
@@ -42,23 +45,7 @@ import subprocess
 # ============================================================================
 
 
-def _ensure_package(pip_name, import_name=None):
-    import_name = import_name or pip_name
-    try:
-        __import__(import_name)
-    except ImportError:
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pip_name])
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(
-                f"Automatic install of '{pip_name}' failed (exit code {e.returncode}). "
-                f"Add '{pip_name}' to requirements.txt and reboot the app on Streamlit Cloud."
-            ) from e
-        __import__(import_name)
 
-
-_ensure_package("anthropic")
-_ensure_package("streamlit")
 
 import os
 import json
