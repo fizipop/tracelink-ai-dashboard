@@ -1,6 +1,6 @@
 """
-TraceLink AI — Real AI Mode (Deep Multi-Component Schema)
------------------------------------------------------------
+fixit — Real AI Mode (Deep Multi-Component Schema)
+-----------------------------------------------------
 Single-file Streamlit application.
 
 Structured extraction is performed by the Anthropic API using forced
@@ -19,16 +19,35 @@ What stays in plain, deterministic Python, and why:
     by the model, so the safety-critical comparison is reproducible.
   * A lightweight internal validator pass runs over the model's JSON
     output (not over the raw text with regex) to sanity-check internal
-    consistency: every component has at least one reading, every
-    reading carries a unit, and a rough token-count cross-check against
-    the source text to catch obviously dropped data. This is a
-    best-effort sanity net, not a guarantee of perfect extraction — no
-    automated pass can promise 100% accuracy against arbitrary messy
-    field text, so its findings are surfaced as review flags rather
-    than treated as ground truth.
+    consistency. This is a best-effort sanity net, not a guarantee of
+    perfect extraction — no automated pass can promise 100% accuracy
+    against arbitrary messy field text, so findings are surfaced as
+    review flags, not treated as ground truth.
 
-Model note: MODEL_NAME is set to "claude-opus-5-5" per the latest
-instruction.
+Model note: MODEL_NAME stays "claude-opus-5-5", per your earlier
+"ignore model name it shud be claude-opus-5-5" instruction — this
+document re-requested "claude-3-5-sonnet-latest" again, which is
+retired on the Claude API, so I kept the override rather than
+reintroducing a model string that will 404. Say the word if you want
+it changed again.
+
+Two UI notes worth flagging up front, since both rely on techniques
+Streamlit doesn't officially support:
+  * The "fixit" title is a real animated <canvas> particle system
+    (rendered inside its own component iframe) — the letters are
+    sampled into a particle grid that springs to its home position and
+    scatters/swirls under the cursor, then eases back on mouse-leave.
+    This only reacts to a real mouse, so on touch devices it just sits
+    static and readable, which is a fine degrade.
+  * The cursor-following glow on the result cards is implemented by
+    reaching from a components.v1.html iframe into `window.parent.document`
+    to attach a mousemove listener to the main app's DOM. This works
+    today because the component iframe is same-origin, but it's an
+    unofficial trick, not a supported Streamlit API — it's wrapped in
+    try/except so a future Streamlit change would silently disable the
+    pointer-follow glow rather than break the app. The breathing
+    pass/fail/unresolved halo on each card does NOT depend on this — 
+    that's pure CSS and will always work.
 """
 
 import sys
@@ -45,14 +64,15 @@ import re
 import json
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 st.set_page_config(
-    page_title="TraceLink AI — Real AI Mode",
+    page_title="fixit",
     layout="wide",
     page_icon="🛠️",
 )
 
-MODEL_NAME = "claude-opus-5-5"
+MODEL_NAME = "claude-opus-5-5"  # see docstring note — claude-3-5-sonnet-latest is retired
 
 # ============================================================================
 # ANTHROPIC CLIENT
@@ -291,8 +311,19 @@ def evaluate(extracted):
     else:
         global_status = "VERIFIED SECURE"
 
+    # Binary safety-filter flag for the aero-glow halo. "CONDITION UNVERIFIED" is
+    # neither a clean pass nor a confirmed failure, so it gets its own neutral
+    # (amber, non-pulsing) halo rather than being forced into True/False.
+    if global_status == "VERIFIED SECURE":
+        passed_safety_filters = True
+    elif global_status == "BLOCKED":
+        passed_safety_filters = False
+    else:
+        passed_safety_filters = None
+
     return {"results": results, "blocked": blocked, "unresolved": unresolved,
-             "confirmed_failures": confirmed_failures, "global_status": global_status}
+             "confirmed_failures": confirmed_failures, "global_status": global_status,
+             "passed_safety_filters": passed_safety_filters}
 
 
 def remediation_steps(component_name):
@@ -375,11 +406,11 @@ st.markdown(
         padding: 14px 18px;
         margin-bottom: 12px;
         transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+        background-repeat: no-repeat;
     }
     .glass-card:hover {
         transform: translateY(-4px);
         border-color: rgba(0, 242, 254, 0.45);
-        box-shadow: 0 8px 28px rgba(0, 242, 254, 0.12);
     }
     .metric-label { color: #9CA3AF; font-size: 0.72rem; text-transform: uppercase; letter-spacing: .05em; }
     .metric-value { color: #F9FAFB; font-size: 1.2rem; font-weight: 700; word-wrap: break-word; }
@@ -388,7 +419,6 @@ st.markdown(
     .component-card.blocked {
         background: linear-gradient(135deg, rgba(220,38,38,0.28), rgba(251,191,36,0.10));
         border-color: rgba(220,38,38,0.6);
-        box-shadow: 0 6px 24px rgba(220,38,38,0.18);
     }
     .component-card.verified { border-color: rgba(22,163,74,0.5); }
     .component-card.unresolved { border-color: rgba(107,114,128,0.5); }
@@ -409,10 +439,127 @@ st.markdown(
         padding: 14px; color: #9CA3AF; font-family: monospace; font-size: 0.8rem;
         max-height: 640px; overflow-y: auto; white-space: pre-wrap;
     }
+    .halo-wrapper { border-radius: 18px; padding: 4px; margin-bottom: 10px; }
+    .halo-pass { animation: breathe-emerald 4s ease-in-out infinite; }
+    .halo-fail { animation: breathe-crimson 3s ease-in-out infinite; }
+    .halo-unresolved { box-shadow: 0 0 30px rgba(251,191,36,0.12); }
+    @keyframes breathe-emerald {
+        0%, 100% { box-shadow: 0 0 25px rgba(16,185,129,0.15); }
+        50% { box-shadow: 0 0 50px rgba(16,185,129,0.32); }
+    }
+    @keyframes breathe-crimson {
+        0%, 100% { box-shadow: 0 0 25px rgba(239,68,68,0.18); }
+        50% { box-shadow: 0 0 55px rgba(239,68,68,0.38); }
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+# --- Cursor-following glow on .glass-card elements (best-effort; see docstring) ---
+components.html(
+    """
+    <script>
+    (function () {
+        try {
+            const doc = window.parent.document;
+            doc.addEventListener('mousemove', function (e) {
+                const cards = doc.querySelectorAll('.glass-card');
+                cards.forEach(function (card) {
+                    const rect = card.getBoundingClientRect();
+                    const x = e.clientX - rect.left;
+                    const y = e.clientY - rect.top;
+                    if (x >= -60 && x <= rect.width + 60 && y >= -60 && y <= rect.height + 60) {
+                        card.style.backgroundImage =
+                            'radial-gradient(circle at ' + x + 'px ' + y + 'px, rgba(0,242,254,0.14), transparent 55%)';
+                    } else {
+                        card.style.backgroundImage = 'none';
+                    }
+                });
+            });
+        } catch (err) {
+            // Same-origin parent-document access isn't guaranteed across all
+            // Streamlit deployments/versions — fail silently, cards keep their
+            // static glass styling with no pointer-follow glow.
+        }
+    })();
+    </script>
+    """,
+    height=0,
+)
+
+
+def render_fixit_title():
+    components.html(
+        """
+        <div style="width:100%;display:flex;justify-content:flex-start;">
+        <canvas id="fixitCanvas" width="480" height="140"
+                style="background:transparent;"></canvas>
+        </div>
+        <script>
+        (function () {
+            const canvas = document.getElementById('fixitCanvas');
+            const ctx = canvas.getContext('2d');
+            const off = document.createElement('canvas');
+            off.width = canvas.width; off.height = canvas.height;
+            const octx = off.getContext('2d');
+            octx.fillStyle = '#FBBF24';
+            octx.font = "700 3.5rem 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif";
+            octx.textBaseline = 'middle';
+            octx.fillText('fixit', 20, off.height / 2 + 6);
+            const img = octx.getImageData(0, 0, off.width, off.height).data;
+
+            const particles = [];
+            const step = 3;
+            for (let y = 0; y < off.height; y += step) {
+                for (let x = 0; x < off.width; x += step) {
+                    const idx = (y * off.width + x) * 4;
+                    if (img[idx + 3] > 120) {
+                        particles.push({ hx: x, hy: y, x: x, y: y, vx: 0, vy: 0 });
+                    }
+                }
+            }
+
+            let mouseX = -9999, mouseY = -9999;
+            canvas.addEventListener('mousemove', function (e) {
+                const rect = canvas.getBoundingClientRect();
+                mouseX = e.clientX - rect.left;
+                mouseY = e.clientY - rect.top;
+            });
+            canvas.addEventListener('mouseleave', function () {
+                mouseX = -9999; mouseY = -9999;
+            });
+
+            function frame() {
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+                ctx.fillStyle = '#FBBF24';
+                for (let i = 0; i < particles.length; i++) {
+                    const p = particles[i];
+                    const dx = p.x - mouseX, dy = p.y - mouseY;
+                    const dist = Math.sqrt(dx * dx + dy * dy) || 0.001;
+                    const radius = 55;
+                    if (dist < radius) {
+                        const force = (radius - dist) / radius;
+                        const angle = Math.atan2(dy, dx) + Math.PI / 2;
+                        p.vx += Math.cos(angle) * force * 2.2 + (dx / dist) * force * 1.4;
+                        p.vy += Math.sin(angle) * force * 2.2 + (dy / dist) * force * 1.4;
+                    }
+                    p.vx += (p.hx - p.x) * 0.09;
+                    p.vy += (p.hy - p.y) * 0.09;
+                    p.vx *= 0.82;
+                    p.vy *= 0.82;
+                    p.x += p.vx;
+                    p.y += p.vy;
+                    ctx.fillRect(p.x, p.y, 2, 2);
+                }
+                requestAnimationFrame(frame);
+            }
+            frame();
+        })();
+        </script>
+        """,
+        height=150,
+    )
 
 
 def metric_html(label, value, accent=None):
@@ -460,11 +607,9 @@ def render_component_card(result):
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-st.title("🛠️ TraceLink AI — Real AI Mode")
-st.caption(f"Structured, multi-component extraction via the Anthropic API ({MODEL_NAME}).")
-
 client = get_client()
 if client is None:
+    render_fixit_title()
     st.error(
         "ANTHROPIC_API_KEY is not set. In Streamlit Cloud, open **Settings → Secrets** for this app "
         "and add:\n\n```\nANTHROPIC_API_KEY = \"sk-ant-...\"\n```"
@@ -498,14 +643,15 @@ if uploaded is not None:
     outcome = evaluate(extracted)
     audit_notices = audit_extraction(report_text, extracted)
 
-    left, right = st.columns([1, 2])
+    left, right = st.columns([1, 1])
 
     with left:
         st.subheader("📡 Ingested Raw Inspection File Stream")
         st.markdown(f"<div class='raw-terminal'>{report_text}</div>", unsafe_allow_html=True)
 
     with right:
-        st.subheader("🧬 Live Structural Verification Matrix")
+        render_fixit_title()
+        st.caption(f"Structured, multi-component extraction via the Anthropic API ({MODEL_NAME}).")
 
         score = extracted.get("extraction_confidence_score")
         if score is None:
@@ -529,14 +675,16 @@ if uploaded is not None:
         c3.markdown(metric_html("Engineering Framework", extracted.get("engineering_framework") or "Not determined"), unsafe_allow_html=True)
 
         if audit_notices:
-            with st.container():
-                st.markdown("#### 🟡 System Extraction Audit Notice")
-                for notice in audit_notices:
-                    st.warning(notice)
+            st.markdown("#### 🟡 System Extraction Audit Notice")
+            for notice in audit_notices:
+                st.warning(notice)
 
+        halo_class = {True: "halo-pass", False: "halo-fail", None: "halo-unresolved"}[outcome["passed_safety_filters"]]
+        st.markdown(f"<div class='halo-wrapper {halo_class}'>", unsafe_allow_html=True)
         st.markdown("#### Calculation Trail Ledger")
         for result in outcome["results"]:
             render_component_card(result)
+        st.markdown("</div>", unsafe_allow_html=True)
 
         ledger = extracted.get("missing_engineering_variables_ledger") or []
         if ledger:
@@ -573,4 +721,5 @@ if uploaded is not None:
         )
 
 else:
+    render_fixit_title()
     st.info("Upload a .txt inspection field log above to run extraction.")
