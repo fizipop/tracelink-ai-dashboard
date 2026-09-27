@@ -6,42 +6,52 @@ Single-file Streamlit application.
 Structured extraction is performed by the Anthropic API using forced
 tool-use against a nested, multi-component schema: each independent
 sub-component of an inspected asset (a column, a base plate, a gusset,
-a flange, ...) gets its own object with its own stated minimum
-thickness and its own list of UT readings, plus an auto-detected
-engineering framework/code jurisdiction and a model-reported extraction
-confidence score.
+a flange, a process tube, ...) gets its own object with its own stated
+minimum thickness, its own list of current UT readings, its own list of
+prior-inspection UT readings (for trend monitoring), plus an
+auto-detected engineering framework/code jurisdiction and a
+model-reported extraction confidence score. A single asset-level
+pressure event (observed peak vs. design pressure) is captured when the
+source text states one.
 
 What stays in plain, deterministic Python, and why:
-  * The pass/fail decision for each component (margin = lowest UT
-    reading for that component - that component's stated minimum, with
-    an ASME B31.3 fallback used ONLY when the asset is process piping
-    and a component has no stated minimum — never for structural
+  * The pass/fail decision for each component (margin = lowest current
+    UT reading for that component - that component's stated minimum,
+    with an ASME B31.3 fallback used ONLY when the asset is process
+    piping and a component has no stated minimum — never for structural
     steel/non-pressurized assets) is computed in plain Python, never by
     the model, so the safety-critical comparison is reproducible.
+  * The historical degradation delta (previous lowest reading vs.
+    current lowest reading) and the pressure-excursion variance
+    (observed vs. design pressure) are both computed as plain
+    arithmetic in Python, never asserted by the model.
   * A lightweight internal validator pass runs over the model's JSON
     output (not over the raw text with regex) as a sanity net before
     anything is rendered. This is best-effort, not a guarantee of
     perfect extraction — no automated pass can promise 100% accuracy
     against arbitrary messy field text, so findings are surfaced as
     review flags, not treated as ground truth.
+  * The engineering disposition is never auto-prescribed as a single
+    fixed outcome. A confirmed exceedance (a mathematical fact — margin
+    below zero) is always rendered separately from the recommended next
+    step, which is labeled as "Awaiting Authorized Engineering/Inspector
+    Review" rather than a final repair order. Unconfirmed findings
+    (e.g. a "possible" weld indication) are always kept as open,
+    unconfirmed items requiring secondary NDT validation, never
+    upgraded to a confirmed defect.
 
-Model note: MODEL_NAME stays "claude-opus-5-5" — this document again
-asked for "claude-3-5-sonnet-latest", which is retired on the Claude
-API, and your earlier instruction was explicitly to keep
-claude-opus-5-5, so that override still stands. Say so if you want it
-changed.
+Model note: MODEL_NAME stays "claude-opus-5-5" per your explicit
+instruction to keep it and disregard the request to switch to
+"claude-3-5-sonnet-latest". Say so if you ever want that changed.
 
-Title note: the "fixit" wordmark below is now pure CSS — no <canvas>,
-no JS, no particle/dot tracking of any kind. The glass fill is a
-translucent color + text-stroke; the hover sheen sweep is a second
-copy of the same text (via a `::before` pseudo-element using
-`content: attr(data-text)`) clipped to a gradient that slides across
-on hover, which is the standard CSS trick for a "shimmer" effect
-without touching the DOM or drawing pixels. The one remaining bit of
-JS in this file is the cursor-following glow on the result cards
-lower down, which is unrelated to the logo and untouched by this
-rewrite; it's wrapped in try/except and degrades silently if
-unavailable.
+Title note: the "fixit" wordmark below is a <span>, not an <h1> — this
+avoids Streamlit's automatic anchor-link injection on native heading
+elements (which was overlapping the glass title) while keeping the
+same pure-CSS glass fill + hover shimmer. No <canvas>, no JS, no
+particle/dot tracking of any kind is used for the logo itself. The one
+remaining bit of JS in this file is the cursor-following glow on the
+result cards lower down, which is unrelated to the logo; it's wrapped
+in try/except and degrades silently if unavailable.
 """
 
 import sys
@@ -196,16 +206,92 @@ st.markdown(
         max-height: 640px; overflow-y: auto; white-space: pre-wrap;
         backdrop-filter: blur(25px) saturate(180%);
     }
+
+    /* Pressure-excursion operational alert: crimson-amber, sits at the very
+       top of the matrix panel so it can never be buried in footnotes. */
+    .pressure-alert-banner {
+        background: linear-gradient(120deg, rgba(127,29,29,0.55), rgba(120,53,15,0.55));
+        border: 1px solid #F59E0B;
+        border-radius: 16px;
+        box-shadow: 0 0 30px rgba(245, 158, 11, 0.25);
+        padding: 16px 20px;
+        margin-bottom: 16px;
+    }
+    .pressure-alert-banner .headline {
+        color: #FEF3C7; font-size: 1.0rem; font-weight: 800; letter-spacing: .02em;
+        text-transform: uppercase; margin-bottom: 4px;
+    }
+    .pressure-alert-banner .body-text { color: #FCE7C3; font-size: 0.92rem; }
+
+    /* Degradation-anomaly card: gold warning, for multi-inspection trend loss. */
+    .degradation-card {
+        background: rgba(120, 95, 15, 0.28);
+        border: 1px solid #FBBF24;
+        border-radius: 16px;
+        box-shadow: 0 0 24px rgba(251, 191, 36, 0.2);
+        padding: 14px 18px;
+        margin: 10px 0 14px 0;
+    }
+    .degradation-card .headline {
+        color: #FDE68A; font-weight: 800; font-size: 0.85rem; letter-spacing: .02em;
+        text-transform: uppercase; margin-bottom: 4px;
+    }
+    .degradation-card .body-text { color: #FEF3C7; font-size: 0.9rem; }
+
+    /* Global status ledger: replaces a bare "BLOCKED" pill with a readable
+       diagnostic sentence naming the exact contributing risk entries. */
+    .status-ledger-banner {
+        border-radius: 16px;
+        padding: 16px 20px;
+        margin-bottom: 16px;
+        font-size: 0.95rem;
+        line-height: 1.5;
+    }
+    .status-ledger-banner.blocked {
+        background: rgba(69, 10, 10, 0.5);
+        border: 1px solid #EF4444;
+        color: #FEE2E2;
+        box-shadow: 0 0 26px rgba(239, 68, 68, 0.2);
+    }
+    .status-ledger-banner.unverified {
+        background: rgba(69, 50, 10, 0.4);
+        border: 1px solid #9CA3AF;
+        color: #F3F4F6;
+    }
+    .status-ledger-banner.secure {
+        background: rgba(6, 55, 30, 0.4);
+        border: 1px solid #16A34A;
+        color: #DCFCE7;
+    }
+    .status-ledger-banner b { color: inherit; }
+
+    /* Confirmed-exceedance / disposition separation */
+    .fact-block {
+        border-left: 3px solid #EF4444;
+        padding: 6px 0 6px 12px;
+        margin: 10px 0;
+    }
+    .fact-block .fact-label {
+        color: #F87171; font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: .04em;
+    }
+    .disposition-block {
+        border-left: 3px solid #9CA3AF;
+        padding: 6px 0 6px 12px;
+        margin: 10px 0;
+    }
+    .disposition-block .disposition-label {
+        color: #D1D5DB; font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: .04em;
+    }
     </style>
 
     <div class="glass-title-container">
-        <h1 class="glass-title" data-text="fixit">fixit</h1>
+        <span class="glass-title" data-text="fixit">fixit</span>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-MODEL_NAME = "claude-opus-5-5"  # see docstring note — claude-3-5-sonnet-latest is retired
+MODEL_NAME = "claude-opus-5-5"  # kept per explicit instruction — do not switch to a retired alias
 
 # ============================================================================
 # ANTHROPIC CLIENT
@@ -221,7 +307,8 @@ def get_client():
 SYSTEM_PROMPT = """You are a structured-data extraction engine for industrial \
 engineering inspection field logs covering multi-component assets: structural \
 steel assemblies (columns, base plates, gussets, beams, braces), pressure \
-vessels, process piping, heat exchangers, storage tanks, and conveyor frames.
+vessels, process piping (including tube bundles), heat exchangers, storage \
+tanks, and conveyor frames.
 
 Read the raw inspection text the user provides and call the \
 `extract_compliance_data` tool with the data you find. Rules:
@@ -231,11 +318,19 @@ Read the raw inspection text the user provides and call the \
   needed for a downstream calculation.
 - Treat the asset as a collection of independent sub-components. Each \
   distinct structural or mechanical element named or clearly implied in the \
-  text (e.g. "North Column", "Base Plate", "Gusset G1", "Beam Flange") gets \
-  its own entry in components_matrix, with its own explicit_minimum_required_mat \
-  and its own ut_thickness_measurements list. Do not merge readings from \
-  different components into one entry, and do not invent components that \
-  are not named or clearly implied.
+  text (e.g. "North Column", "Base Plate", "Gusset G1", "Beam Flange", \
+  "Process Tubes") gets its own entry in components_matrix, with its own \
+  explicit_minimum_required_mat and its own ut_thickness_measurements list. \
+  Do not merge readings from different components into one entry, and do \
+  not invent components that are not named or clearly implied. If a \
+  component is named but the text gives it neither a stated minimum nor any \
+  reading, still create its entry with both left empty/null — do not omit it.
+- "historical_ut_thickness_measurements" holds readings the text attributes \
+  to a prior inspection (a previous date, a "last inspection", a baseline) \
+  for that same component, in the same {location_label, value, unit} shape \
+  as ut_thickness_measurements. Leave the list empty if the text gives no \
+  prior-inspection reading for that component. Never treat a current-cycle \
+  reading as historical, and never treat a historical reading as current.
 - "engineering_framework" is the applicable code/jurisdiction if the text \
   states or clearly implies one (e.g. "ASME Sec VIII", "ASME B31.3", \
   "AWS D1.1", "API 653"); null if not determinable.
@@ -253,6 +348,12 @@ Read the raw inspection text the user provides and call the \
   value (typically a large number, e.g. in the thousands, in psi or MPa) \
   with an adjacent small decimal thickness reading — they are different \
   quantities even when they appear near each other in the text.
+- "pressure_event" captures a single logged operating-pressure excursion at \
+  the asset level: the observed/peak pressure reading and the stated design \
+  pressure threshold, only if the text explicitly gives both. Leave both \
+  null if either is not explicitly stated. Do not confuse this with the \
+  B31.3 design_pressure used for wall-thickness calculation — record both \
+  fields independently even if they share the same numeric value.
 - Preserve stated uncertainty rather than resolving it. A "possible" or \
   "suspected" weld indication must be recorded as an unconfirmed finding \
   (is_confirmed_failure: false) describing it as needing NDT validation — \
@@ -298,6 +399,15 @@ EXTRACTION_TOOL = {
                     "corrosion_allowance": {"type": ["number", "null"]},
                 },
             },
+            "pressure_event": {
+                "type": ["object", "null"],
+                "description": "A single logged operating-pressure excursion at the asset level, only if both values are explicitly stated.",
+                "properties": {
+                    "observed_pressure": {"type": ["number", "null"]},
+                    "design_pressure_threshold": {"type": ["number", "null"]},
+                    "unit": {"type": ["string", "null"]},
+                },
+            },
             "components_matrix": {
                 "type": "array",
                 "items": {
@@ -314,6 +424,19 @@ EXTRACTION_TOOL = {
                         },
                         "ut_thickness_measurements": {
                             "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "location_label": {"type": "string"},
+                                    "value": {"type": "number"},
+                                    "unit": {"type": ["string", "null"]},
+                                },
+                                "required": ["location_label", "value"],
+                            },
+                        },
+                        "historical_ut_thickness_measurements": {
+                            "type": "array",
+                            "description": "Prior-inspection readings for this same component, if the text gives any.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -394,6 +517,30 @@ def calc_b31_3_mat(piping_vars):
     return mat, [], note
 
 
+def compute_degradation(component):
+    """Plain-Python trend check: compares the lowest historical reading to
+    the lowest current reading for this component. Returns None if there is
+    nothing to compare, or a dict describing the delta (only ever flagged as
+    an anomaly when thickness has genuinely decreased)."""
+    current = component.get("ut_thickness_measurements") or []
+    historical = component.get("historical_ut_thickness_measurements") or []
+    if not current or not historical:
+        return None
+
+    lowest_current = min(current, key=lambda r: r["value"])
+    lowest_historical = min(historical, key=lambda r: r["value"])
+    delta = round(lowest_historical["value"] - lowest_current["value"], 4)
+
+    return {
+        "component_name": component.get("component_name") or "Unnamed Component",
+        "previous_value": lowest_historical["value"],
+        "current_value": lowest_current["value"],
+        "unit": lowest_current.get("unit") or lowest_historical.get("unit") or "",
+        "delta": delta,
+        "is_loss": delta > 0,  # positive delta = thickness went down over time
+    }
+
+
 def evaluate_component(component, is_piping, piping_vars):
     """is_piping gates the B31.3 fallback so it never fires for structural steel
     or other non-pressurized assets."""
@@ -402,9 +549,15 @@ def evaluate_component(component, is_piping, piping_vars):
     mat_field = component.get("explicit_minimum_required_mat")
     mat = mat_field.get("value") if mat_field else None
     mat_unit = mat_field.get("unit") if mat_field else None
+    degradation = compute_degradation(component)
 
     if not ut_list:
-        return {"name": name, "status": "no_measurements", "raw": component}
+        # Distinguish "we have a stated minimum but nothing to test it against"
+        # from "we have neither criteria nor measurements at all" — the two
+        # are engineering-critical to tell apart in the UI.
+        status = "no_measurements" if mat is not None else "no_criteria_no_measurements"
+        return {"name": name, "status": status, "mat": mat, "mat_unit": mat_unit,
+                 "degradation": degradation, "raw": component}
 
     calc_note = None
     if mat is None:
@@ -412,17 +565,38 @@ def evaluate_component(component, is_piping, piping_vars):
             mat, missing, calc_note = calc_b31_3_mat(piping_vars)
             if mat is None:
                 return {"name": name, "status": "insufficient", "missing_vars": missing,
-                         "ut_measurements": ut_list, "raw": component}
+                         "ut_measurements": ut_list, "degradation": degradation, "raw": component}
         else:
             return {"name": name, "status": "insufficient",
                      "missing_vars": ["Explicit Minimum Required MAT (not stated for this component)"],
-                     "ut_measurements": ut_list, "raw": component}
+                     "ut_measurements": ut_list, "degradation": degradation, "raw": component}
 
     lowest = min(ut_list, key=lambda r: r["value"])
     margin = round(lowest["value"] - mat, 4)
     status = "blocked" if margin < 0 else "verified"
     return {"name": name, "status": status, "mat": mat, "mat_unit": mat_unit, "lowest": lowest,
-             "margin": margin, "calc_note": calc_note, "raw": component}
+             "margin": margin, "calc_note": calc_note, "degradation": degradation, "raw": component}
+
+
+def evaluate_pressure_event(pressure_event):
+    """Plain-Python variance calc for a logged overpressure excursion.
+    Returns None unless both values are explicitly present and the observed
+    reading actually exceeds the design threshold."""
+    if not pressure_event:
+        return None
+    observed = pressure_event.get("observed_pressure")
+    design = pressure_event.get("design_pressure_threshold")
+    if observed is None or design is None or design == 0:
+        return None
+    if observed <= design:
+        return None
+    variance_abs = round(observed - design, 4)
+    variance_pct = round((variance_abs / design) * 100, 1)
+    unit = pressure_event.get("unit") or "psi"
+    return {
+        "observed": observed, "design": design, "unit": unit,
+        "variance_abs": variance_abs, "variance_pct": variance_pct,
+    }
 
 
 def evaluate(extracted):
@@ -433,9 +607,12 @@ def evaluate(extracted):
 
     results = [evaluate_component(c, is_piping, piping_vars) for c in components]
     blocked = [r for r in results if r["status"] == "blocked"]
-    unresolved = [r for r in results if r["status"] in ("insufficient", "no_measurements")]
+    unresolved = [r for r in results if r["status"] in ("insufficient", "no_measurements", "no_criteria_no_measurements")]
+    degradations = [r["degradation"] for r in results if r.get("degradation") and r["degradation"]["is_loss"]]
     confirmed_failures = [a for a in (extracted.get("field_anomalies") or []) if a.get("is_confirmed_failure")]
+    unconfirmed_findings = [a for a in (extracted.get("field_anomalies") or []) if not a.get("is_confirmed_failure")]
     ledger = extracted.get("missing_engineering_variables_ledger") or []
+    pressure_excursion = evaluate_pressure_event(extracted.get("pressure_event"))
 
     if not results:
         global_status = "CONDITION UNVERIFIED"
@@ -446,8 +623,58 @@ def evaluate(extracted):
     else:
         global_status = "VERIFIED SECURE"
 
+    ledger_message = build_status_ledger_message(
+        global_status, blocked, unresolved, pressure_excursion, unconfirmed_findings
+    )
+
     return {"results": results, "blocked": blocked, "unresolved": unresolved,
-             "confirmed_failures": confirmed_failures, "global_status": global_status}
+             "confirmed_failures": confirmed_failures, "unconfirmed_findings": unconfirmed_findings,
+             "degradations": degradations, "pressure_excursion": pressure_excursion,
+             "global_status": global_status, "ledger_message": ledger_message}
+
+
+def build_status_ledger_message(global_status, blocked, unresolved, pressure_excursion, unconfirmed_findings):
+    """Builds a context-specific diagnostic sentence naming the exact
+    parameters driving the restriction, instead of a bare status word."""
+    if global_status == "VERIFIED SECURE":
+        return "VERIFIED SECURE: All mapped components carry a stated criteria set and a current reading at or above minimum. No confirmed exceedances on file."
+
+    risk_entries = []
+    lead = None
+
+    if blocked:
+        worst = min(blocked, key=lambda r: r["margin"])
+        lead = f"{worst['name']} thickness drops below the stated minimum threshold"
+        for r in blocked:
+            unit = f" {r['mat_unit']}" if r.get("mat_unit") else ""
+            risk_entries.append(f"{r['name']} margin {r['margin']:+.4f}{unit} below minimum")
+
+    if pressure_excursion:
+        risk_entries.append(
+            f"{pressure_excursion['observed']:g} {pressure_excursion['unit']} overpressure excursion "
+            f"(+{pressure_excursion['variance_abs']:g} {pressure_excursion['unit']} / "
+            f"+{pressure_excursion['variance_pct']:g}%)"
+        )
+
+    for r in unresolved:
+        if r["status"] == "no_criteria_no_measurements":
+            risk_entries.append(f"unverified {r['name'].lower()} — no criteria or readings on file")
+        elif r["status"] == "no_measurements":
+            risk_entries.append(f"unverified {r['name'].lower()} — criteria on file but untested")
+        elif r["status"] == "insufficient":
+            risk_entries.append(f"{r['name'].lower()} margin uncalculable — missing engineering variables")
+
+    for a in unconfirmed_findings:
+        risk_entries.append(f"unconfirmed finding pending NDT validation ({a.get('finding', 'unspecified')})")
+
+    if not risk_entries:
+        return f"{global_status}: No mapped components resolved to a confirmed status; awaiting further data."
+
+    if lead is None:
+        lead = f"{len(risk_entries)} unresolved risk item(s) on file"
+
+    entries_text = "; ".join(risk_entries)
+    return f"{global_status}: {lead}. Unresolved risk entries include: {entries_text}."
 
 
 def remediation_steps(component_name):
@@ -468,6 +695,10 @@ def remediation_steps(component_name):
         return ["Re-torque per the flange's bolt pattern and verify gasket seating before returning to service.",
                  "Check for leakage/weeping at the reduced-thickness zone under normal operating pressure.",
                  "Route to piping engineering for a B31.3 reassessment of this joint."]
+    if "tube" in n:
+        return ["Do not assume acceptability from thickness alone — schedule a wall-thickness examination (UT/eddy current) for this bundle.",
+                 "Confirm the design acceptance criteria for this tube bundle with piping/mechanical engineering before disposition.",
+                 "Flag for Authorized Inspector review pending both criteria and readings being established."]
     if "shell" in n or "head" in n:
         return ["Perform a local Fitness-for-Service assessment (e.g. API 579 Level 1/2) before continued operation.",
                  "Grid the surrounding area to bound the extent of the thin region.",
@@ -492,7 +723,7 @@ def audit_extraction(report_text, extracted):
             f"{total_readings} were mapped into components — some readings may not have been assigned."
         )
 
-    keywords = ["column", "plate", "gusset", "flange", "shell", "head", "nozzle", "beam", "brace", "support"]
+    keywords = ["column", "plate", "gusset", "flange", "shell", "head", "nozzle", "beam", "brace", "support", "tube"]
     text_lower = report_text.lower()
     matrix_text = " ".join(c.get("component_name", "").lower() for c in components)
     for kw in keywords:
@@ -552,10 +783,51 @@ def metric_html(label, value, accent=None):
     return f"<div class='glass-card'><div class='metric-label'>{label}</div><div class='{cls}'>{value}</div></div>"
 
 
+def render_pressure_alert_banner(pressure_excursion):
+    st.markdown(
+        f"<div class='pressure-alert-banner'>"
+        f"<div class='headline'>⚠ Pressure Excursion Detected</div>"
+        f"<div class='body-text'>Observed peak of {pressure_excursion['observed']:g} "
+        f"{pressure_excursion['unit']} against a stated design pressure threshold of "
+        f"{pressure_excursion['design']:g} {pressure_excursion['unit']}. Threshold variance: "
+        f"+{pressure_excursion['variance_abs']:g} {pressure_excursion['unit']} / "
+        f"+{pressure_excursion['variance_pct']:g}% overload. Flagged for immediate operational review — "
+        f"do not defer to a footnote.</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_degradation_card(deg):
+    st.markdown(
+        f"<div class='degradation-card'>"
+        f"<div class='headline'>Degradation Anomaly Captured</div>"
+        f"<div class='body-text'>{deg['component_name']}: prior lowest reading "
+        f"{deg['previous_value']:.4f} {deg['unit']} now measures {deg['current_value']:.4f} {deg['unit']} — "
+        f"an observed reduction of -{deg['delta']:.4f} {deg['unit']}. Flagged for immediate corrosion-rate "
+        f"and remaining-life evaluation loops.</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_status_ledger_banner(outcome):
+    gs = outcome["global_status"]
+    css_class = "blocked" if gs == "BLOCKED" else ("secure" if gs == "VERIFIED SECURE" else "unverified")
+    st.markdown(
+        f"<div class='status-ledger-banner {css_class}'><b>{outcome['ledger_message']}</b></div>",
+        unsafe_allow_html=True,
+    )
+
+
 def render_component_card(result):
     status = result["status"]
     css_class = "blocked" if status == "blocked" else ("verified" if status == "verified" else "unresolved")
-    pill_label = {"blocked": "Blocked", "verified": "Verified", "insufficient": "Unresolved", "no_measurements": "No Data"}[status]
+    pill_label = {
+        "blocked": "Blocked",
+        "verified": "Verified",
+        "insufficient": "Unresolved",
+        "no_measurements": "No Data",
+        "no_criteria_no_measurements": "Unverified",
+    }[status]
 
     st.markdown(
         f"<div class='glass-card component-card {css_class}'>"
@@ -564,27 +836,53 @@ def render_component_card(result):
         unsafe_allow_html=True,
     )
 
+    # Multi-inspection historical trend — surfaced for every component that has
+    # a comparable prior reading, regardless of current pass/fail status.
+    deg = result.get("degradation")
+    if deg and deg["is_loss"]:
+        render_degradation_card(deg)
+
     if status in ("blocked", "verified"):
         unit_suffix = f" {result['mat_unit']}" if result.get("mat_unit") else ""
         lowest = result["lowest"]
         lowest_unit = f" {lowest['unit']}" if lowest.get("unit") else ""
         c1, c2, c3 = st.columns(3)
-        c1.markdown(metric_html("Lowest Reading", f"{lowest['location_label']}: {lowest['value']:.4f}{lowest_unit}"), unsafe_allow_html=True)
-        c2.markdown(metric_html("Stated Minimum (MAT)", f"{result['mat']:.4f}{unit_suffix}"), unsafe_allow_html=True)
+        c1.markdown(metric_html("Measured Minimum UT", f"{lowest['location_label']}: {lowest['value']:.4f}{lowest_unit}"), unsafe_allow_html=True)
+        c2.markdown(metric_html("Required Minimum MAT", f"{result['mat']:.4f}{unit_suffix}"), unsafe_allow_html=True)
         margin_accent = "accent-gold" if status == "blocked" else "accent-cyan"
-        c3.markdown(metric_html("True Margin", f"{result['margin']:+.4f}", margin_accent), unsafe_allow_html=True)
+        c3.markdown(metric_html("Computed True Margin", f"{result['margin']:+.4f}", margin_accent), unsafe_allow_html=True)
         if result.get("calc_note"):
             st.info(result["calc_note"])
+
         if status == "blocked":
-            st.markdown("**Remediation action steps:**")
-            for step in remediation_steps(result["name"]):
-                st.markdown(f"- {step}")
+            # Confirmed fact (the math) kept visually and structurally separate
+            # from the recommended pathway (which is not a final disposition).
+            st.markdown(
+                f"<div class='fact-block'><div class='fact-label'>Confirmed Exceedance — Mathematical Fact</div>"
+                f"Measured minimum ({lowest['value']:.4f}{lowest_unit}) is below the required minimum MAT "
+                f"({result['mat']:.4f}{unit_suffix}) by {abs(result['margin']):.4f}.</div>",
+                unsafe_allow_html=True,
+            )
+            steps_html = "".join(f"<li>{s}</li>" for s in remediation_steps(result["name"]))
+            st.markdown(
+                f"<div class='disposition-block'><div class='disposition-label'>Recommended Engineering Pathway — "
+                f"Awaiting Authorized Engineering/Inspector Review</div><ul>{steps_html}</ul>"
+                f"<div style='color:#9CA3AF;font-size:0.8rem;'>This is a suggested exploration path, not a final "
+                f"disposition — the confirmed exceedance above stands independent of whichever pathway is ultimately "
+                f"authorized.</div></div>",
+                unsafe_allow_html=True,
+            )
     elif status == "insufficient":
         st.write("Cannot compute a margin for this component — missing:")
         for m in result["missing_vars"]:
             st.markdown(f"- ❌ **{m}**")
-    else:
+    elif status == "no_measurements":
         st.write("A minimum is on file for this component, but no UT readings were extracted for it.")
+    else:  # no_criteria_no_measurements
+        st.warning(
+            "No design acceptance criteria or wall-thickness examination metrics provided; "
+            "structural condition is unverified."
+        )
 
     with st.expander("View Raw Source Extraction Line"):
         st.json(result["raw"])
@@ -637,6 +935,13 @@ if uploaded is not None:
     else:
         confidence_label = "Low"
 
+    # Pressure-excursion alert always sits at the very top of the matrix panel.
+    if outcome["pressure_excursion"]:
+        render_pressure_alert_banner(outcome["pressure_excursion"])
+
+    st.markdown("#### Global Engineering Status Ledger")
+    render_status_ledger_banner(outcome)
+
     st.markdown("#### Dual Status Banners")
     m1, m2 = st.columns(2)
     m1.markdown(metric_html("Extraction Confidence (text legibility)", confidence_label, "accent-cyan"), unsafe_allow_html=True)
@@ -663,6 +968,7 @@ if uploaded is not None:
         c3.markdown(metric_html("Engineering Framework", extracted.get("engineering_framework") or "Not determined"), unsafe_allow_html=True)
 
         st.markdown("#### Calculation Trail Ledger")
+        st.caption("Component Name → Measured Minimum UT → Required Minimum MAT → Computed True Margin → Status → Recommended Engineering Pathway")
         for result in outcome["results"]:
             render_component_card(result)
 
