@@ -1,7 +1,3 @@
-__import__('pysqlite3')
-import sys
-sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
-
 import streamlit as st
 import json
 from anthropic import Anthropic
@@ -15,7 +11,6 @@ ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 anthropic_client = Anthropic(api_key=ANTHROPIC_KEY) if ANTHROPIC_KEY else None
 
 # --- STEP 1 & 2 ARCHITECTURE: THE WEB-SAFE COMPLIANCE DATA MATRIX ---
-# We store our core regulations inside a secure internal array matrix mapping variables
 REGULATORY_MATRIX = {
     "AS9100-AEROSPACE-STANDARD": {
         "clauses": [
@@ -102,15 +97,19 @@ if uploaded_file is not None:
                 report_data = json.loads(response.content.text)
         else:
             # Fallback Local Sandbox Logic Loop if testing without an API key active
-            is_material_fail = not any(mat in raw_report_text for mat in active_track["allowed_materials"])
+            is_material_fail = not any(mat.lower() in raw_report_text.lower() for mat in active_track["allowed_materials"])
             is_stress_fail = any(str(val) in raw_report_text for val in ["520.0", "390.0", "385.0"])
+            
+            # Additional safety mapping variables based on report keywords
+            mat_name = "Inconel-718" if "Inconel" in raw_report_text else ("Structural-Steel-A36" if "Steel" in raw_report_text else "Unknown Compound")
+            stress_val = 520.0 if "520.0" in raw_report_text else (385.0 if "385.0" in raw_report_text else 210.0)
             
             report_data = {
                 "passed_safety_checks": not (is_material_fail or is_stress_fail),
                 "violations_detected": (1 if is_material_fail else 0) + (1 if is_stress_fail else 0),
-                "material_found": "Inconel-718" if "Inconel" in raw_report_text else ("Structural-Steel-A36" if "Steel" in raw_report_text else "Unknown"),
-                "extracted_stress_mpa": 520.0 if "520.0" in raw_report_text else (385.0 if "385.0" in raw_report_text else 210.0),
-                "error_summary": "Material compound mismatch and mechanical force overload captured along load metrics." if (is_material_fail or is_stress_fail) else ""
+                "material_found": mat_name,
+                "extracted_stress_mpa": stress_val,
+                "error_summary": "Material structure specification conflict and mechanical force threshold breach observed on testing floor metrics." if (is_material_fail or is_stress_fail) else ""
             }
 
         # Render corresponding dashboard status lights based on outputs
@@ -127,5 +126,5 @@ if uploaded_file is not None:
             
         st.markdown("---")
         with st.expander("🔍 View Active RAG Data Retrieval Logs (Steps 1 & 2 Vector Outputs)", expanded=False):
-            st.markdown("**Relevant Regulatory Clauses Pulled From 800-Page Index Index database Structure:**")
+            st.markdown("**Relevant Regulatory Clauses Pulled From 800-Page Index Database Structure:**")
             st.info(extracted_clauses)
