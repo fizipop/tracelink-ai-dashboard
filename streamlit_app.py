@@ -24,6 +24,42 @@ model, `claude-sonnet-5` — change MODEL_NAME below if your account
 should target a different one.
 """
 
+import sys
+import subprocess
+
+# ============================================================================
+# AUTOMATED RUNTIME INSTALLER — runs before any other import in this file.
+# ----------------------------------------------------------------------------
+# Belt-and-suspenders fix for a Streamlit Cloud container that boots from a
+# stale/cached environment and skips requirements.txt: if a package can't be
+# imported, install it with the *same* interpreter running this script
+# (sys.executable — not a bare "pip", which can resolve to a different
+# environment) and try the import again. Real fix to also apply on your end:
+# confirm requirements.txt sits at the repo root next to this file, then use
+# "Reboot app" (not just a rerun) in Streamlit Cloud so it rebuilds the
+# environment from scratch. This installer just makes the app self-healing
+# either way.
+# ============================================================================
+
+
+def _ensure_package(pip_name, import_name=None):
+    import_name = import_name or pip_name
+    try:
+        __import__(import_name)
+    except ImportError:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", pip_name])
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"Automatic install of '{pip_name}' failed (exit code {e.returncode}). "
+                f"Add '{pip_name}' to requirements.txt and reboot the app on Streamlit Cloud."
+            ) from e
+        __import__(import_name)
+
+
+_ensure_package("anthropic")
+_ensure_package("streamlit")
+
 import os
 import json
 
@@ -136,7 +172,7 @@ def extract_with_claude(client, report_text):
     the SDK hands back an already-parsed Python dict — no JSON.loads /
     fence-stripping needed on our side."""
     response = client.messages.create(
-        model=claude-sonnet-5,
+        model=MODEL_NAME,
         max_tokens=2000,
         system=SYSTEM_PROMPT,
         tools=[EXTRACTION_TOOL],
