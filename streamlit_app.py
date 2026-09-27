@@ -1,20 +1,45 @@
 """
-fixit — Real AI Mode (Deep Multi-Component Schema)
+fixit — Real AI Mode (Dual-Pass Hybrid Extraction)
 -----------------------------------------------------
 Single-file Streamlit application.
 
-Structured extraction is performed by the Anthropic API using forced
-tool-use against a nested, multi-component schema: each independent
-sub-component of an inspected asset (a column, a base plate, a gusset,
-a flange, a process tube, ...) gets its own object with its own stated
-minimum thickness, its own list of current UT readings, its own list of
-prior-inspection UT readings (for trend monitoring), plus an
-auto-detected engineering framework/code jurisdiction and a
-model-reported extraction confidence score. A single asset-level
-pressure event (observed peak vs. design pressure) is captured when the
-source text states one.
+ARCHITECTURE CHANGE FROM THE PRIOR VERSION: the model is no longer asked
+to return a deeply nested JSON array (components -> nested MAT object ->
+nested UT-reading array). On very dense reports, a deeply nested
+tool-use schema asks the model to hold open several levels of JSON
+structure simultaneously while also transcribing many numeric values,
+and that combination is where token-budget pressure and truncated tool
+calls are most likely to show up. Splitting the job in two — a single
+flat text field for transcription, parsed by plain Python afterward —
+removes one layer of that structural bookkeeping and gives one string
+field a much larger, singular token allowance instead of splitting the
+budget across many nested objects. That is a real mitigation, not a
+guarantee: no format change makes an LLM's output immune to truncation
+on an arbitrarily long input, so this file still surfaces parse
+problems as visible audit notices rather than silently pretending
+nothing was dropped.
 
-What stays in plain, deterministic Python, and why:
+Dual-pass framework:
+  PASS 1 (model, via extract_with_claude): the model reads the raw
+    report and returns asset-level fields (asset_category, metallurgy,
+    engineering_framework, extraction_confidence_score,
+    piping_design_variables, pressure_event, missing_engineering_
+    variables_ledger, field_anomalies) as before, PLUS a single string
+    field, "flat_manifest_block", holding every component's name,
+    stated minimum, unit, current UT readings, and any prior-inspection
+    UT readings as plain marked-up text (see FLAT_MANIFEST_FORMAT_SPEC
+    below for the exact grammar).
+  PASS 2 (plain Python, native_parameter_matrix_parser): splits that
+    string on its own explicit boundary markers and reconstructs the
+    same per-component structure the rest of this file already expects
+    (component_name / explicit_minimum_required_mat / ut_thickness_
+    measurements / historical_ut_thickness_measurements). This pass
+    runs entirely in the container with ordinary string methods and
+    regex — no second model call, no dependency on the model getting
+    JSON nesting right.
+
+What stays in plain, deterministic Python, and why (unchanged from
+before):
   * The pass/fail decision for each component (margin = lowest current
     UT reading for that component - that component's stated minimum,
     with an ASME B31.3 fallback used ONLY when the asset is process
@@ -25,29 +50,29 @@ What stays in plain, deterministic Python, and why:
     current lowest reading) and the pressure-excursion variance
     (observed vs. design pressure) are both computed as plain
     arithmetic in Python, never asserted by the model.
-  * A lightweight internal validator pass runs over the model's JSON
-    output (not over the raw text with regex) as a sanity net before
-    anything is rendered. This is best-effort, not a guarantee of
-    perfect extraction — no automated pass can promise 100% accuracy
-    against arbitrary messy field text, so findings are surfaced as
-    review flags, not treated as ground truth.
+  * A lightweight internal validator pass runs over the *parsed* data
+    (not over the raw text with regex, and not trusted from the model
+    as ground truth) as a sanity net before anything is rendered. This
+    is best-effort, not a guarantee of perfect extraction — findings
+    are surfaced as review flags, not treated as fact.
   * The engineering disposition is never auto-prescribed as a single
     fixed outcome. A confirmed exceedance (a mathematical fact — margin
     below zero) is always rendered separately from the recommended next
     step, which is labeled as "Awaiting Authorized Engineering/Inspector
     Review" rather than a final repair order. Unconfirmed findings
-    (e.g. a "possible" weld indication) are always kept as open,
-    unconfirmed items requiring secondary NDT validation, never
-    upgraded to a confirmed defect.
+    (e.g. a "possible" weld indication, or an untorqued fastener) are
+    always kept as open, unconfirmed items pending secondary
+    verification, never upgraded to a confirmed defect.
 
-Model note: MODEL_NAME stays "claude-opus-5-5" per your explicit
-instruction to keep it and disregard the request to switch to
-"claude-3-5-sonnet-latest". Say so if you ever want that changed.
+Model note: MODEL_NAME stays "claude-opus-5-5" per your standing
+instruction.
 
-Title note: the "fixit" wordmark below is a <span>, not an <h1> — this
-avoids Streamlit's automatic anchor-link injection on native heading
-elements (which was overlapping the glass title) while keeping the
-same pure-CSS glass fill + hover shimmer. No <canvas>, no JS, no
+Title note: the "fixit" wordmark is a <span> inside its own isolated
+container div, not an <h1> — this avoids Streamlit's automatic
+anchor-link injection on native heading elements. A global CSS rule
+also hides Streamlit's anchor-chain icon on any other native headers
+used elsewhere in the page (st.subheader, markdown "####" blocks), so
+no 🔗 icon appears anywhere in the app. No <canvas>, no JS, no
 particle/dot tracking of any kind is used for the logo itself. The one
 remaining bit of JS in this file is the cursor-following glow on the
 result cards lower down, which is unrelated to the logo; it's wrapped
@@ -91,6 +116,12 @@ st.markdown(
             #0A0E1A;
         background-attachment: fixed;
     }
+
+    /* Remove Streamlit's default top padding and any residual native-header
+       anchor-chain icons (🔗) anywhere else in the page. */
+    .block-container { padding-top: 2rem; }
+    [data-testid="stHeaderActionElements"] { display: none !important; }
+    h1 a, h2 a, h3 a, h4 a, h5 a, h6 a { display: none !important; }
 
     .glass-title-container {
         margin: 0 auto;
@@ -282,16 +313,21 @@ st.markdown(
     .disposition-block .disposition-label {
         color: #D1D5DB; font-size: 0.7rem; font-weight: 800; text-transform: uppercase; letter-spacing: .04em;
     }
+
+    /* Calculation-trail table used inside each component card */
+    .calc-trail-table { width: 100%; border-collapse: collapse; margin: 8px 0 4px 0; }
+    .calc-trail-table td { padding: 4px 8px; font-size: 0.85rem; color: #E5E7EB; vertical-align: top; }
+    .calc-trail-table td.label { color: #9CA3AF; white-space: nowrap; width: 1%; }
     </style>
 
-    <div class="glass-title-container">
+    <div><div class="glass-title-container">
         <span class="glass-title" data-text="fixit">fixit</span>
-    </div>
+    </div></div>
     """,
     unsafe_allow_html=True,
 )
 
-MODEL_NAME = "claude-opus-5-5"  # kept per explicit instruction — do not switch to a retired alias
+MODEL_NAME = "claude-opus-5-5"  # kept per explicit standing instruction
 
 # ============================================================================
 # ANTHROPIC CLIENT
@@ -304,43 +340,68 @@ def get_client():
     return anthropic.Anthropic(api_key=api_key)
 
 
-SYSTEM_PROMPT = """You are a structured-data extraction engine for industrial \
+# ----------------------------------------------------------------------------
+# FLAT MANIFEST FORMAT SPEC — the exact grammar the model must emit inside
+# the single "flat_manifest_block" string field. Kept as a constant (rather
+# than only inline in the prompt) so the parser docstring below and the
+# system prompt can both reference the identical spec text.
+# ----------------------------------------------------------------------------
+FLAT_MANIFEST_FORMAT_SPEC = """\
+Component: <component name, exactly as named or clearly implied in the text>
+MAT: <numeric stated minimum, only if explicitly stated — omit this whole line if none is stated>
+Unit: <unit string, e.g. in, mm — omit this whole line if no unit is stated>
+UT: <label>=<value>, <label>=<value>, ...   (omit this whole line if no current readings exist)
+Historical_UT: <label>=<value>, ...          (omit this whole line if no prior-inspection readings exist)
+Component_End
+
+Repeat one such block per component, separated by a blank line. Use a
+real prior location label from the text for each <label> if the text
+names sampling points (e.g. North=0.598); if the text gives readings
+with no location name at all, label them sequentially R1=, R2=, etc.
+Never invent a reading or a minimum that is not in the text."""
+
+
+SYSTEM_PROMPT = f"""You are a structured-data extraction engine for industrial \
 engineering inspection field logs covering multi-component assets: structural \
 steel assemblies (columns, base plates, gussets, beams, braces), pressure \
-vessels, process piping (including tube bundles), heat exchangers, storage \
-tanks, and conveyor frames.
+vessels, process piping (including tube bundles / heating coils), heat \
+exchangers, storage tanks, and conveyor frames.
 
 Read the raw inspection text the user provides and call the \
-`extract_compliance_data` tool with the data you find. Rules:
+`extract_compliance_data` tool. Rules:
+
 - Extract only what is actually stated in the text. Never invent, estimate, \
-  or "helpfully" fill in a value that is not present — use null for anything \
-  not stated, and list it in missing_engineering_variables_ledger if it is \
-  needed for a downstream calculation.
+  or "helpfully" fill in a value that is not present — use null (or an \
+  omitted line, per the manifest format below) for anything not stated, and \
+  list it in missing_engineering_variables_ledger if it is needed for a \
+  downstream calculation.
+
+- "flat_manifest_block" is a single string holding every component's data as \
+  plain marked-up text — NOT JSON, NOT a nested array. Follow this exact \
+  grammar for every component block:
+
+{FLAT_MANIFEST_FORMAT_SPEC}
+
 - Treat the asset as a collection of independent sub-components. Each \
   distinct structural or mechanical element named or clearly implied in the \
   text (e.g. "North Column", "Base Plate", "Gusset G1", "Beam Flange", \
-  "Process Tubes") gets its own entry in components_matrix, with its own \
-  explicit_minimum_required_mat and its own ut_thickness_measurements list. \
-  Do not merge readings from different components into one entry, and do \
-  not invent components that are not named or clearly implied. If a \
-  component is named but the text gives it neither a stated minimum nor any \
-  reading, still create its entry with both left empty/null — do not omit it.
-- "historical_ut_thickness_measurements" holds readings the text attributes \
-  to a prior inspection (a previous date, a "last inspection", a baseline) \
-  for that same component, in the same {location_label, value, unit} shape \
-  as ut_thickness_measurements. Leave the list empty if the text gives no \
-  prior-inspection reading for that component. Never treat a current-cycle \
-  reading as historical, and never treat a historical reading as current.
+  "Process Tubes") gets its own "Component:" block. Do not merge readings \
+  from different components into one block, and do not invent components \
+  that are not named or clearly implied. If a component is named but the \
+  text gives it neither a stated minimum nor any reading, still emit its \
+  block with both the MAT and UT lines omitted — do not omit the component \
+  entirely.
+- A "Historical_UT:" line holds readings the text attributes to a prior \
+  inspection (a previous date, a "last inspection", a baseline) for that \
+  same component. Omit the line if the text gives no prior-inspection \
+  reading for that component. Never treat a current-cycle reading as \
+  historical, and never treat a historical reading as current.
 - "engineering_framework" is the applicable code/jurisdiction if the text \
   states or clearly implies one (e.g. "ASME Sec VIII", "ASME B31.3", \
   "AWS D1.1", "API 653"); null if not determinable.
 - "extraction_confidence_score" is your own 0.0-1.0 estimate of how legible \
   and unambiguous the source text was for this extraction — not a measure \
   of the asset's physical condition.
-- "explicit_minimum_required_mat" is whatever the report calls that \
-  component's minimum/allowable/permitted thickness limit. If it is not \
-  explicitly stated for that component, leave it null even if you could \
-  calculate one yourself — calculation is handled outside this tool.
 - "piping_design_variables" (design pressure, outside diameter, allowable \
   stress, quality/joint factor, Y coefficient, corrosion allowance) apply at \
   the asset level and are only relevant for process piping. Extract each \
@@ -353,24 +414,31 @@ Read the raw inspection text the user provides and call the \
   pressure threshold, only if the text explicitly gives both. Leave both \
   null if either is not explicitly stated. Do not confuse this with the \
   B31.3 design_pressure used for wall-thickness calculation — record both \
-  fields independently even if they share the same numeric value.
+  independently even if they share the same numeric value.
 - Preserve stated uncertainty rather than resolving it. A "possible" or \
   "suspected" weld indication must be recorded as an unconfirmed finding \
-  (is_confirmed_failure: false) describing it as needing NDT validation — \
-  never upgraded to a confirmed defect. Unverified/untorqued fasteners must \
-  likewise be recorded as unconfirmed and described as pending verification, \
-  not as a confirmed connection failure. Only set is_confirmed_failure: true \
-  when the text itself states the item failed, is rejected, or is out of \
-  tolerance.
+  (is_confirmed_failure: false) with notes describing it as needing NDT \
+  validation — never upgraded to a confirmed defect. A corroded, loose, or \
+  unverified fastener must likewise be recorded as unconfirmed, with notes \
+  describing it as pending torque verification — never as a confirmed \
+  connection failure. Only set is_confirmed_failure: true when the text \
+  itself states the item failed, is rejected, or is out of tolerance.
 - "field_anomalies" should capture every inspector note, flagged indication, \
   weld observation, fastener condition note, or geometry/alignment issue, in \
   the report's own words in the "notes" field.
 - Do not comment on overall compliance, pass/fail, or safety — only extract \
-  data as stated."""
+  data as stated. All pass/fail comparison, degradation-delta, and pressure- \
+  variance math is performed afterward in plain Python, not by you."""
 
 EXTRACTION_TOOL = {
     "name": "extract_compliance_data",
-    "description": "Record structured, multi-component fields extracted from an industrial inspection field log.",
+    "description": (
+        "Record structured fields extracted from an industrial inspection field log. "
+        "Per-component data (name, stated minimum, current and historical UT readings) "
+        "is returned as a single flat marked-up text block, not a nested array, so a "
+        "dense report with many readings does not require the model to hold open many "
+        "levels of JSON nesting at once."
+    ),
     "input_schema": {
         "type": "object",
         "properties": {
@@ -408,48 +476,13 @@ EXTRACTION_TOOL = {
                     "unit": {"type": ["string", "null"]},
                 },
             },
-            "components_matrix": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "component_name": {"type": "string"},
-                        "nominal_thickness": {
-                            "type": ["object", "null"],
-                            "properties": {"value": {"type": ["number", "null"]}, "unit": {"type": ["string", "null"]}},
-                        },
-                        "explicit_minimum_required_mat": {
-                            "type": ["object", "null"],
-                            "properties": {"value": {"type": ["number", "null"]}, "unit": {"type": ["string", "null"]}},
-                        },
-                        "ut_thickness_measurements": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "location_label": {"type": "string"},
-                                    "value": {"type": "number"},
-                                    "unit": {"type": ["string", "null"]},
-                                },
-                                "required": ["location_label", "value"],
-                            },
-                        },
-                        "historical_ut_thickness_measurements": {
-                            "type": "array",
-                            "description": "Prior-inspection readings for this same component, if the text gives any.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "location_label": {"type": "string"},
-                                    "value": {"type": "number"},
-                                    "unit": {"type": ["string", "null"]},
-                                },
-                                "required": ["location_label", "value"],
-                            },
-                        },
-                    },
-                    "required": ["component_name", "ut_thickness_measurements"],
-                },
+            "flat_manifest_block": {
+                "type": "string",
+                "description": (
+                    "Every component's data as plain marked-up text (Component: / MAT: / Unit: / "
+                    "UT: / Historical_UT: / Component_End), one block per component. See system "
+                    "prompt for the exact grammar. This replaces a nested JSON components array."
+                ),
             },
             "missing_engineering_variables_ledger": {
                 "type": "array",
@@ -469,7 +502,7 @@ EXTRACTION_TOOL = {
                 },
             },
         },
-        "required": ["asset_category", "components_matrix", "field_anomalies"],
+        "required": ["asset_category", "flat_manifest_block", "field_anomalies"],
     },
 }
 
@@ -477,7 +510,11 @@ EXTRACTION_TOOL = {
 def extract_with_claude(client, report_text):
     response = client.messages.create(
         model=MODEL_NAME,
-        max_tokens=3500,
+        # Raised from the prior version's 3500: a single flat string field can
+        # legitimately need more room on a dense report than several small
+        # nested objects did, since there's no longer per-object JSON
+        # scaffolding splitting up the budget.
+        max_tokens=6000,
         system=SYSTEM_PROMPT,
         tools=[EXTRACTION_TOOL],
         tool_choice={"type": "auto"},
@@ -487,6 +524,166 @@ def extract_with_claude(client, report_text):
         if block.type == "tool_use" and block.name == "extract_compliance_data":
             return dict(block.input)
     raise RuntimeError("Model did not return a structured extraction — no tool_use block found.")
+
+# ============================================================================
+# PASS 2 — NATIVE PYTHON DISPOSITION PARSER
+# (turns the model's flat "flat_manifest_block" string into the same
+#  per-component structure the rest of this file expects, using plain
+#  string splitting/regex only — no second model call, no JSON parsing
+#  of model output, so it cannot be broken by an incomplete/truncated
+#  JSON array.)
+# ============================================================================
+
+_NUMERIC_RE = re.compile(r"[-+]?\d*\.?\d+")
+
+
+def _coerce_float(raw_value):
+    """Pulls the first numeric token out of a string; returns None if there
+    isn't one. Deliberately tolerant of stray units/whitespace the model
+    might still emit inline (e.g. '0.500 in')."""
+    if raw_value is None:
+        return None
+    match = _NUMERIC_RE.search(raw_value)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _parse_reading_list(line_value, fallback_unit):
+    """Parses a 'UT:' or 'Historical_UT:' line value into a list of
+    {location_label, value, unit} dicts. Accepts 'Label=value' pairs
+    (preferred) or bare comma-separated values (auto-labeled R1, R2, ...)."""
+    readings = []
+    if not line_value:
+        return readings
+    for i, part in enumerate([p.strip() for p in line_value.split(",")], start=1):
+        if not part:
+            continue
+        if "=" in part:
+            label, _, value_str = part.partition("=")
+            label = label.strip() or f"R{i}"
+        else:
+            label, value_str = f"R{i}", part
+        value = _coerce_float(value_str)
+        if value is None:
+            continue  # skip unparseable tokens rather than fabricate a reading
+        readings.append({"location_label": label, "value": value, "unit": fallback_unit})
+    return readings
+
+
+def _parse_single_component_block(block_text):
+    """Parses one 'Component: ... ' block (already stripped of its trailing
+    Component_End marker) into the component dict shape evaluate_component()
+    expects. Returns None if the block has no recognizable component name."""
+    component_name = None
+    mat_value = None
+    mat_unit = None
+    ut_line_value = None
+    historical_line_value = None
+
+    for line in block_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("component:"):
+            component_name = line.split(":", 1)[1].strip()
+        elif line.lower().startswith("mat:"):
+            mat_value = _coerce_float(line.split(":", 1)[1])
+        elif line.lower().startswith("unit:"):
+            mat_unit = line.split(":", 1)[1].strip() or None
+        elif line.lower().startswith("historical_ut:"):
+            historical_line_value = line.split(":", 1)[1]
+        elif line.lower().startswith("ut:"):
+            ut_line_value = line.split(":", 1)[1]
+
+    if not component_name:
+        return None
+
+    ut_readings = _parse_reading_list(ut_line_value, mat_unit)
+    historical_readings = _parse_reading_list(historical_line_value, mat_unit)
+
+    return {
+        "component_name": component_name,
+        "explicit_minimum_required_mat": (
+            {"value": mat_value, "unit": mat_unit} if mat_value is not None else None
+        ),
+        "ut_thickness_measurements": ut_readings,
+        "historical_ut_thickness_measurements": historical_readings,
+    }
+
+
+def native_parameter_matrix_parser(manifest_text, raw_report):
+    """Splits the model's flat_manifest_block on its own explicit boundary
+    markers and rebuilds the per-component matrix in plain Python. This is
+    the piece of the pipeline that is immune to the model dropping or
+    truncating a nested JSON array — it only ever operates on plain text
+    splitting, so a partially-cut-off block degrades to "one fewer
+    component parsed" (visible in parse_notices) rather than an exception
+    that blanks the whole matrix.
+
+    `raw_report` is accepted (and currently unused directly) so this
+    function's signature matches callers that want to cross-reference the
+    original text in future audit passes without changing the call site.
+
+    Returns: (components: list[dict], parse_notices: list[str])
+    """
+    components_out = []
+    notices = []
+
+    if not manifest_text or not manifest_text.strip():
+        notices.append(
+            "The model returned an empty flat_manifest_block — no components could be parsed. "
+            "Treat this extraction as unverified rather than as 'zero components found in the report'."
+        )
+        return components_out, notices
+
+    # Split on the explicit end marker. Trailing content after the last
+    # marker (e.g. a stray partial block from truncation) is inspected too,
+    # so a cut-off final component still surfaces as a notice instead of
+    # silently vanishing.
+    raw_segments = manifest_text.split("Component_End")
+    trailing = raw_segments[-1]
+    segments = raw_segments[:-1] if len(raw_segments) > 1 else raw_segments
+
+    for segment in segments:
+        block = segment.strip()
+        if not block:
+            continue
+        if "component:" not in block.lower():
+            continue
+        try:
+            parsed = _parse_single_component_block(block)
+        except Exception as e:  # defensive: one bad block must not blank the matrix
+            parsed = None
+            notices.append(f"Skipped an unparseable component block during flat-manifest parsing: {e}")
+        if parsed is not None:
+            components_out.append(parsed)
+        else:
+            notices.append("Found a 'Component:' block with no recoverable component name — skipped it.")
+
+    if trailing.strip() and "component:" in trailing.lower():
+        notices.append(
+            "The flat manifest block appears to end with an unterminated component (no closing "
+            "'Component_End' marker) — this may indicate output was cut short. That component was "
+            "still parsed on a best-effort basis if a name and any fields were recoverable."
+        )
+        try:
+            parsed = _parse_single_component_block(trailing.strip())
+            if parsed is not None:
+                components_out.append(parsed)
+        except Exception:
+            pass
+
+    if not components_out:
+        notices.append(
+            "No components could be parsed out of a non-empty flat_manifest_block — check the raw "
+            "block in the debug expander below; the manifest may not follow the expected grammar."
+        )
+
+    return components_out, notices
 
 # ============================================================================
 # DETERMINISTIC EVALUATION
@@ -695,11 +892,11 @@ def remediation_steps(component_name):
         return ["Re-torque per the flange's bolt pattern and verify gasket seating before returning to service.",
                  "Check for leakage/weeping at the reduced-thickness zone under normal operating pressure.",
                  "Route to piping engineering for a B31.3 reassessment of this joint."]
-    if "tube" in n:
+    if "tube" in n or "coil" in n:
         return ["Do not assume acceptability from thickness alone — schedule a wall-thickness examination (UT/eddy current) for this bundle.",
-                 "Confirm the design acceptance criteria for this tube bundle with piping/mechanical engineering before disposition.",
+                 "Confirm the design acceptance criteria for this bundle with piping/mechanical engineering before disposition.",
                  "Flag for Authorized Inspector review pending both criteria and readings being established."]
-    if "shell" in n or "head" in n:
+    if "shell" in n or "head" in n or "skirt" in n:
         return ["Perform a local Fitness-for-Service assessment (e.g. API 579 Level 1/2) before continued operation.",
                  "Grid the surrounding area to bound the extent of the thin region.",
                  "Consider a pressure de-rate as an interim measure pending repair."]
@@ -708,11 +905,12 @@ def remediation_steps(component_name):
              "Do not return the component to unrestricted service until disposition is issued."]
 
 # ============================================================================
-# INTERNAL VALIDATOR PASS (sanity net over the model's JSON — best-effort, not a guarantee)
+# INTERNAL VALIDATOR PASS (sanity net over the parsed component data — best-
+# effort, not a guarantee — plus flat-manifest-specific parse notices)
 # ============================================================================
 
-def audit_extraction(report_text, extracted):
-    notices = []
+def audit_extraction(report_text, extracted, parse_notices):
+    notices = list(parse_notices)
     components = extracted.get("components_matrix") or []
 
     numeric_tokens = re.findall(r"\b\d+\.\d+\b", report_text)
@@ -723,7 +921,7 @@ def audit_extraction(report_text, extracted):
             f"{total_readings} were mapped into components — some readings may not have been assigned."
         )
 
-    keywords = ["column", "plate", "gusset", "flange", "shell", "head", "nozzle", "beam", "brace", "support", "tube"]
+    keywords = ["column", "plate", "gusset", "flange", "shell", "head", "nozzle", "beam", "brace", "support", "tube", "coil", "skirt"]
     text_lower = report_text.lower()
     matrix_text = " ".join(c.get("component_name", "").lower() for c in components)
     for kw in keywords:
@@ -803,8 +1001,8 @@ def render_degradation_card(deg):
         f"<div class='headline'>Degradation Anomaly Captured</div>"
         f"<div class='body-text'>{deg['component_name']}: prior lowest reading "
         f"{deg['previous_value']:.4f} {deg['unit']} now measures {deg['current_value']:.4f} {deg['unit']} — "
-        f"an observed reduction of -{deg['delta']:.4f} {deg['unit']}. Flagged for immediate corrosion-rate "
-        f"and remaining-life evaluation loops.</div></div>",
+        f"an observed reduction of -{deg['delta']:.4f} {deg['unit']}. Flagged for remaining-life "
+        f"tracking and corrosion-rate evaluation loops.</div></div>",
         unsafe_allow_html=True,
     )
 
@@ -846,11 +1044,18 @@ def render_component_card(result):
         unit_suffix = f" {result['mat_unit']}" if result.get("mat_unit") else ""
         lowest = result["lowest"]
         lowest_unit = f" {lowest['unit']}" if lowest.get("unit") else ""
-        c1, c2, c3 = st.columns(3)
-        c1.markdown(metric_html("Measured Minimum UT", f"{lowest['location_label']}: {lowest['value']:.4f}{lowest_unit}"), unsafe_allow_html=True)
-        c2.markdown(metric_html("Required Minimum MAT", f"{result['mat']:.4f}{unit_suffix}"), unsafe_allow_html=True)
-        margin_accent = "accent-gold" if status == "blocked" else "accent-cyan"
-        c3.markdown(metric_html("Computed True Margin", f"{result['margin']:+.4f}", margin_accent), unsafe_allow_html=True)
+
+        # Auditable calculation-trail table: Component -> Measured Minimum UT ->
+        # Required Minimum MAT -> Computed True Margin -> Status, in one row.
+        st.markdown(
+            "<table class='calc-trail-table'>"
+            f"<tr><td class='label'>Measured Minimum UT</td><td>{lowest['location_label']}: {lowest['value']:.4f}{lowest_unit}</td></tr>"
+            f"<tr><td class='label'>Required Minimum MAT</td><td>{result['mat']:.4f}{unit_suffix}</td></tr>"
+            f"<tr><td class='label'>Computed True Margin</td><td>{result['margin']:+.4f}</td></tr>"
+            f"<tr><td class='label'>Status</td><td>{pill_label}</td></tr>"
+            "</table>",
+            unsafe_allow_html=True,
+        )
         if result.get("calc_note"):
             st.info(result["calc_note"])
 
@@ -884,7 +1089,7 @@ def render_component_card(result):
             "structural condition is unverified."
         )
 
-    with st.expander("View Raw Source Extraction Line"):
+    with st.expander("View Raw Source Extraction Parameters Line"):
         st.json(result["raw"])
 
     st.markdown("</div>", unsafe_allow_html=True)
@@ -906,10 +1111,14 @@ if uploaded is not None:
     cache_key = f"{uploaded.name}:{len(raw_bytes)}:{hash(raw_bytes)}"
 
     if st.session_state.get("cache_key") != cache_key:
-        with st.spinner(f"Checking this amazing file"):
+        with st.spinner("Checking this amazing file"):
             try:
                 extracted = extract_with_claude(client, report_text)
+                manifest_text = extracted.get("flat_manifest_block", "")
+                components_matrix, parse_notices = native_parameter_matrix_parser(manifest_text, report_text)
+                extracted["components_matrix"] = components_matrix
                 st.session_state["extracted"] = extracted
+                st.session_state["parse_notices"] = parse_notices
                 st.session_state["cache_key"] = cache_key
                 st.session_state["api_error"] = None
             except anthropic.APIError as e:
@@ -922,8 +1131,9 @@ if uploaded is not None:
         st.stop()
 
     extracted = st.session_state["extracted"]
+    parse_notices = st.session_state.get("parse_notices", [])
     outcome = evaluate(extracted)
-    audit_notices = audit_extraction(report_text, extracted)
+    audit_notices = audit_extraction(report_text, extracted, parse_notices)
 
     score = extracted.get("extraction_confidence_score")
     if score is None:
@@ -990,7 +1200,10 @@ if uploaded is not None:
                     unsafe_allow_html=True,
                 )
 
-    with st.expander("Raw structured response from the model"):
+    with st.expander("Raw flat_manifest_block returned by the model (pre-parse)"):
+        st.text(extracted.get("flat_manifest_block", ""))
+
+    with st.expander("Raw structured response from the model (post-parse)"):
         st.json(extracted)
 
     with st.expander("Reference standard definitions"):
