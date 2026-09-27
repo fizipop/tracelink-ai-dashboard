@@ -1,51 +1,31 @@
 """
-TraceLink AI — Real AI Mode
------------------------------
-Single-file Streamlit application. All local text-parsing has been
-removed (no tokenizer, no line_dict, no keyword-weight/proximity
-scoring, no regex-style loops). Structured extraction is now performed
-entirely by the Anthropic API using forced tool-use, which guarantees
-a schema-conformant JSON object back — no manual JSON-string parsing
-or markdown-fence stripping required.
+TraceLink AI — Real AI Mode (Multi-Component Schema)
+-----------------------------------------------------
+Single-file Streamlit application.
 
-What this file still does locally, in plain Python, and why:
-  * The API key is read once via os.environ.get("ANTHROPIC_API_KEY")
-    and never hard-coded — set it in Streamlit Cloud's
-    Settings -> Secrets panel as ANTHROPIC_API_KEY = "sk-ant-...".
-  * The pass/fail *decision* (margin = lowest reading - MAT, and the
-    ASME B31.3 fallback arithmetic when no MAT is stated) stays in
-    deterministic Python. Anthropic's model extracts the numbers;
-    it does not get asked to "decide" the compliance verdict itself,
-    so the safety-critical comparison is auditable and reproducible.
+Structured extraction is performed entirely by the Anthropic API using
+forced tool-use against a hierarchical, multi-component schema. A single
+inspected asset (a structural frame, a heat exchanger, a piping run, ...)
+can contain many independent sub-components (columns, base plates,
+gussets, flanges, shells, ...), each with its own minimum allowable
+thickness and its own list of UT thickness readings. This file evaluates
+every sub-component separately rather than collapsing the asset into one
+flat number.
 
-Model note: the request specified `claude-3-5-sonnet-20241022`, which
-has been retired on the Claude API. This uses the current comparable
-model, `claude-sonnet-5` — change  below if your account
-should target a different one.
+What stays in plain, deterministic Python, and why:
+  * The pass/fail decision for each component (margin = lowest UT reading
+    for that component - that component's minimum allowable thickness,
+    with an ASME B31.3 fallback calculation when a component is flagged
+    as pressurized piping and has no stated limit) is computed in plain
+    Python, not by the model. Anthropic's model only extracts the raw
+    numbers from the report text; it never renders a compliance verdict
+    itself, so the safety-critical arithmetic is auditable and
+    reproducible independent of the model's phrasing on any given call.
+
+Model note: "claude-3-5-sonnet-latest" was requested, but that model has
+been retired on the Claude API. This uses a current model instead —
+change MODEL_NAME below if your account should target a different one.
 """
-import os
-import json
-import streamlit as st
-import anthropic
-import sys
-import subprocess
-
-# ============================================================================
-# AUTOMATED RUNTIME INSTALLER — runs before any other import in this file.
-# ----------------------------------------------------------------------------
-# Belt-and-suspenders fix for a Streamlit Cloud container that boots from a
-# stale/cached environment and skips requirements.txt: if a package can't be
-# imported, install it with the *same* interpreter running this script
-# (sys.executable — not a bare "pip", which can resolve to a different
-# environment) and try the import again. Real fix to also apply on your end:
-# confirm requirements.txt sits at the repo root next to this file, then use
-# "Reboot app" (not just a rerun) in Streamlit Cloud so it rebuilds the
-# environment from scratch. This installer just makes the app self-healing
-# either way.
-# ============================================================================
-
-
-
 
 import os
 import json
@@ -59,7 +39,7 @@ st.set_page_config(
     page_icon="🛠️",
 )
 
-MODEL_NAME = "claude-opus-5-5"  # see note above — claude-3-5-sonnet-20241022 is retired
+MODEL_NAME = "claude-sonnet-5"  # claude-3-5-sonnet-latest is retired; see note above
 
 # ============================================================================
 # ANTHROPIC CLIENT
@@ -73,33 +53,48 @@ def get_client():
 
 
 SYSTEM_PROMPT = """You are a structured-data extraction engine for industrial \
-engineering inspection reports (pressure vessels, process piping, structural \
-steel, heat exchangers, storage tanks, and any other mechanical asset).
+engineering inspection reports covering multi-component assets: structural \
+steel assemblies (columns, base plates, gussets, beams), pressure vessels, \
+process piping, heat exchangers, storage tanks, conveyor frames, and similar \
+mechanical assets.
 
 Read the raw inspection report text the user provides and call the \
 `extract_compliance_data` tool with the data you find. Rules:
 - Extract only what is actually stated in the text. Never invent, estimate, \
   or "helpfully" fill in a value that is not present — use null for anything \
   not stated.
-- "design_limit_mat" is whatever the report calls its minimum/allowable/ \
-  permitted thickness limit (may be labeled MAT, minimum allowable thickness, \
-  minimum wall, etc.). If no such limit is explicitly stated, leave it null \
-  even if you could calculate one yourself — calculation is handled outside \
-  this tool.
+- Treat the asset as a collection of independent sub-components. Each \
+  distinct structural or mechanical element mentioned (e.g. "North Column", \
+  "Base Plates", "Gusset G1", "Beam Flange", "Shell Course 1") becomes its \
+  own entry in components_matrix, with its own minimum_allowable_thickness \
+  and its own ut_measurements list. Do not merge readings from different \
+  components into one entry, and do not invent components that are not \
+  named or clearly implied in the text.
+- "minimum_allowable_thickness" is whatever the report calls that \
+  component's minimum/allowable/permitted thickness limit (may be labeled \
+  MAT, minimum allowable thickness, minimum wall, retirement thickness, \
+  etc.). If no such limit is explicitly stated for that component, leave it \
+  null even if you could calculate one yourself — calculation is handled \
+  outside this tool.
+- "is_pressurized_piping" should be true only if the asset itself is a \
+  pressurized pipe/piping run and at least one component lacks a stated \
+  limit, since that is what triggers the ASME B31.3 fallback math.
 - "design_variables" are the ASME B31.3 pipe-wall inputs (design pressure, \
   outside diameter, allowable stress, quality/joint factor, Y coefficient, \
-  corrosion allowance) — populate only the ones actually present in the text.
-- "ut_readings" should include every individual thickness/UT measurement \
-  point in the report, keyed by whatever label the report uses for it \
-  (e.g. "A1", "West HSS", "Gusset").
+  corrosion allowance) — populate only the ones actually present in the \
+  text. These apply at the asset level, not per component.
+- "ut_measurements" for each component should include every individual \
+  thickness/UT reading taken on that specific component, with whatever \
+  location label the report uses (e.g. "C1", "F3", "Point A").
 - "field_anomalies" should capture every inspector note, recommendation, \
-  flagged indication, weld flaw, bolt condition issue, or similar unresolved \
-  mechanical observation, in the report's own words.
+  flagged indication, weld flaw, un-torqued bolt, or geometry/alignment \
+  issue, in the report's own words, regardless of which component it \
+  relates to.
 - Do not comment on compliance, pass/fail, or safety — only extract data."""
 
 EXTRACTION_TOOL = {
     "name": "extract_compliance_data",
-    "description": "Record structured fields extracted from an industrial inspection report.",
+    "description": "Record structured, multi-component fields extracted from an industrial inspection report.",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -111,20 +106,13 @@ EXTRACTION_TOOL = {
                 "type": ["string", "null"],
                 "description": "Material/metallurgy specification as stated in the report.",
             },
-            "nominal_thickness": {
-                "type": ["object", "null"],
-                "properties": {"value": {"type": "number"}, "unit": {"type": ["string", "null"]}},
-                "required": ["value"],
-            },
-            "design_limit_mat": {
-                "type": ["object", "null"],
-                "description": "The explicitly stated minimum/allowable thickness limit, if any.",
-                "properties": {"value": {"type": "number"}, "unit": {"type": ["string", "null"]}},
-                "required": ["value"],
+            "is_pressurized_piping": {
+                "type": "boolean",
+                "description": "True if the asset is a pressurized pipe/piping run lacking a stated limit, triggering the B31.3 fallback.",
             },
             "design_variables": {
                 "type": ["object", "null"],
-                "description": "ASME B31.3 pipe-wall inputs, only if present in the text.",
+                "description": "ASME B31.3 pipe-wall inputs, only if present in the text. Applies at the asset level.",
                 "properties": {
                     "design_pressure": {"type": ["number", "null"]},
                     "outside_diameter": {"type": ["number", "null"]},
@@ -134,13 +122,41 @@ EXTRACTION_TOOL = {
                     "corrosion_allowance": {"type": ["number", "null"]},
                 },
             },
-            "ut_readings": {
-                "type": "object",
-                "description": "Every measurement point, keyed by its label in the report.",
-                "additionalProperties": {
+            "components_matrix": {
+                "type": "array",
+                "description": "One entry per independent sub-component of the asset.",
+                "items": {
                     "type": "object",
-                    "properties": {"value": {"type": "number"}, "unit": {"type": ["string", "null"]}},
-                    "required": ["value"],
+                    "properties": {
+                        "component_name": {"type": "string"},
+                        "minimum_allowable_thickness": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "value": {"type": ["number", "null"]},
+                                "unit": {"type": ["string", "null"]},
+                            },
+                        },
+                        "nominal_thickness": {
+                            "type": ["object", "null"],
+                            "properties": {
+                                "value": {"type": ["number", "null"]},
+                                "unit": {"type": ["string", "null"]},
+                            },
+                        },
+                        "ut_measurements": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "location_label": {"type": "string"},
+                                    "value": {"type": "number"},
+                                    "unit": {"type": ["string", "null"]},
+                                },
+                                "required": ["location_label", "value"],
+                            },
+                        },
+                    },
+                    "required": ["component_name", "ut_measurements"],
                 },
             },
             "field_anomalies": {
@@ -149,7 +165,7 @@ EXTRACTION_TOOL = {
                 "description": "Inspector notes, flaws, indications, or unresolved mechanical items.",
             },
         },
-        "required": ["asset_category", "ut_readings", "field_anomalies"],
+        "required": ["asset_category", "components_matrix", "field_anomalies"],
     },
 }
 
@@ -158,9 +174,10 @@ def extract_with_claude(client, report_text):
     """Send the report to Claude and return the structured extraction as a Python dict."""
     response = client.messages.create(
         model=MODEL_NAME,
-        max_tokens=2000,
+        max_tokens=3000,
         system=SYSTEM_PROMPT,
         tools=[EXTRACTION_TOOL],
+        tool_choice={"type": "tool", "name": "extract_compliance_data"},
         messages=[{"role": "user", "content": report_text}],
     )
 
@@ -176,48 +193,136 @@ def extract_with_claude(client, report_text):
 # DETERMINISTIC EVALUATION (stays in plain Python — not delegated to the model)
 # ============================================================================
 
-def evaluate(extracted):
-    mat_field = extracted.get("design_limit_mat")
-    mat = mat_field["value"] if mat_field else None
+B31_3_VARS = [
+    ("design_pressure", "Design Pressure"),
+    ("outside_diameter", "Outside Diameter"),
+    ("allowable_stress", "Allowable Stress"),
+    ("quality_factor", "Quality/Joint Factor"),
+    ("y_coefficient", "Y Coefficient"),
+    ("corrosion_allowance", "Corrosion Allowance"),
+]
+
+
+def calc_b31_3_mat(design_variables):
+    """Return (mat, missing_var_names, calc_note). mat is None if inputs are incomplete."""
+    dv = design_variables or {}
+    missing = [label for key, label in B31_3_VARS if dv.get(key) is None]
+    if missing:
+        return None, missing, None
+
+    P = dv["design_pressure"]
+    D = dv["outside_diameter"]
+    S = dv["allowable_stress"]
+    E = dv["quality_factor"]
+    Y = dv["y_coefficient"]
+    CA = dv["corrosion_allowance"]
+
+    t_design = (P * D) / (2 * (S * E + P * Y))
+    mat = t_design + CA
+    calc_note = (
+        f"No explicit minimum allowable thickness was stated for this component, so the "
+        f"ASME B31.3 straight-pipe formula was applied to the model-extracted design "
+        f"variables: t_design = (P×D)/(2×(S×E+P×Y)) = {t_design:.4f}. Adding the corrosion "
+        f"allowance ({CA:.3f}) gives a calculated safety ceiling of {mat:.4f}."
+    )
+    return mat, [], calc_note
+
+
+def evaluate_component(component, is_pressurized_piping, design_variables):
+    name = component.get("component_name") or "Unnamed Component"
+    ut_measurements = component.get("ut_measurements") or []
+    mat_field = component.get("minimum_allowable_thickness")
+    mat = mat_field.get("value") if mat_field else None
+    mat_unit = mat_field.get("unit") if mat_field else None
     calc_note = None
 
+    if not ut_measurements:
+        return {"name": name, "status": "no_measurements", "mat": mat, "mat_unit": mat_unit}
+
     if mat is None:
-        dv = extracted.get("design_variables") or {}
-        P, D, S, E, Y, CA = (
-            dv.get("design_pressure"), dv.get("outside_diameter"), dv.get("allowable_stress"),
-            dv.get("quality_factor"), dv.get("y_coefficient"), dv.get("corrosion_allowance"),
-        )
-        missing = [name for name, val in [
-            ("Design Pressure", P), ("Outside Diameter", D), ("Allowable Stress", S),
-            ("Quality/Joint Factor", E), ("Y Coefficient", Y), ("Corrosion Allowance", CA),
-        ] if val is None]
+        if is_pressurized_piping:
+            mat, missing, calc_note = calc_b31_3_mat(design_variables)
+            if mat is None:
+                return {
+                    "name": name, "status": "insufficient",
+                    "missing_vars": missing, "ut_measurements": ut_measurements,
+                }
+        else:
+            return {
+                "name": name, "status": "insufficient",
+                "missing_vars": ["Minimum Allowable Thickness (not stated for this component)"],
+                "ut_measurements": ut_measurements,
+            }
 
-        if missing:
-            return {"status": "insufficient", "missing_vars": missing}
-
-        t_design = (P * D) / (2 * (S * E + P * Y))
-        mat = t_design + CA
-        calc_note = (
-            f"No explicit MAT/threshold was stated, so the ASME B31.3 straight-pipe formula was "
-            f"applied to the model-extracted variables: t_design = (P×D)/(2×(S×E+P×Y)) = "
-            f"{t_design:.4f}. Adding the corrosion allowance ({CA:.3f}) gives a calculated safety "
-            f"ceiling of {mat:.4f}."
-        )
-
-    readings = extracted.get("ut_readings") or {}
-    if not readings:
-        return {"status": "no_measurements", "mat": mat, "calc_note": calc_note}
-
-    lowest_label, lowest_entry = min(readings.items(), key=lambda kv: kv[1]["value"])
-    lowest_val = lowest_entry["value"]
-    margin = round(lowest_val - mat, 4)
+    lowest = min(ut_measurements, key=lambda r: r["value"])
+    margin = round(lowest["value"] - mat, 4)
     status = "blocked" if margin < 0 else "verified"
 
     return {
-        "status": status, "mat": mat, "lowest_label": lowest_label, "lowest_val": lowest_val,
-        "margin": margin, "calc_note": calc_note,
+        "name": name, "status": status, "mat": mat, "mat_unit": mat_unit,
+        "lowest": lowest, "margin": margin, "calc_note": calc_note,
     }
 
+
+def evaluate(extracted):
+    components = extracted.get("components_matrix") or []
+    is_piping = bool(extracted.get("is_pressurized_piping"))
+    design_variables = extracted.get("design_variables")
+
+    results = [evaluate_component(c, is_piping, design_variables) for c in components]
+    blocked = [r for r in results if r["status"] == "blocked"]
+    unresolved = [r for r in results if r["status"] in ("insufficient", "no_measurements")]
+
+    if not results:
+        global_status = "no_components"
+    elif blocked:
+        global_status = "BLOCKED"
+    elif unresolved or extracted.get("field_anomalies"):
+        global_status = "CONDITION NOT FULLY VERIFIED - ENGINEERING REVIEW REQUIRED"
+    else:
+        global_status = "VERIFIED SECURE"
+
+    return {"results": results, "blocked": blocked, "unresolved": unresolved, "global_status": global_status}
+
+
+def remediation_steps(component_name):
+    """Bulleted next steps, tailored a little by the kind of component involved."""
+    n = component_name.lower()
+    if "column" in n:
+        return [
+            "Route to a structural engineer for a reduced-section load rating before any load is reapplied.",
+            "Verify against adjacent column readings to rule out a localized corrosion cell.",
+            "Consider a doubler plate or full section replacement per the engineer's disposition.",
+        ]
+    if "base plate" in n or "baseplate" in n:
+        return [
+            "Check anchor bolt torque and grout condition — thinning at a base plate often co-occurs with bolt/grout issues.",
+            "Confirm bearing area is still adequate for the design axial/moment load at the reduced thickness.",
+            "Schedule replacement or plate doubling per Authorized Inspector / structural engineer review.",
+        ]
+    if "gusset" in n:
+        return [
+            "Evaluate remaining gusset section against the connection's design shear/moment capacity.",
+            "Inspect welds at the gusset-to-member interface for cracking driven by the reduced stiffness.",
+            "Do not defer — gussets are frequently the limiting element in a braced connection.",
+        ]
+    if "flange" in n:
+        return [
+            "Re-torque per the flange's bolt pattern and verify gasket seating before returning to service.",
+            "Check for leakage/weeping at the reduced-thickness zone under normal operating pressure.",
+            "Route to piping engineering for a B31.3 reassessment of this joint.",
+        ]
+    if "shell" in n or "head" in n:
+        return [
+            "Perform a local Fitness-for-Service (FFS) assessment (e.g. API 579 Level 1/2) before continued operation.",
+            "Grid the surrounding area to bound the extent of the thin region.",
+            "Consider a pressure de-rate as an interim measure pending repair.",
+        ]
+    return [
+        "Route this component to Fitness-for-Service (FFS) / Authorized Inspector review.",
+        "Bound the extent of the thin area with supplemental UT grid readings.",
+        "Do not return the component to unrestricted service until disposition is issued.",
+    ]
 
 # ============================================================================
 # UI
@@ -232,6 +337,16 @@ st.markdown(
     .metric-value {color:#F9FAFB;font-size:1.25rem;font-weight:700;word-wrap:break-word;}
     .anomaly-box {background:#3F2D0B;border:1px solid #A16207;border-radius:10px;
         padding:12px 16px;margin-bottom:6px;color:#FDE68A;}
+    .component-card {border-radius:12px;padding:16px 18px;margin-bottom:14px;border:1px solid #374151;}
+    .component-card.blocked {background:#450A0A;border-color:#DC2626;}
+    .component-card.verified {background:#052E1B;border-color:#16A34A;}
+    .component-card.unresolved {background:#1F2937;border-color:#6B7280;}
+    .component-title {font-size:1.05rem;font-weight:700;color:#F9FAFB;margin-bottom:8px;}
+    .status-pill {display:inline-block;padding:2px 10px;border-radius:999px;font-size:0.72rem;
+        font-weight:700;letter-spacing:.03em;text-transform:uppercase;margin-left:8px;}
+    .status-pill.blocked {background:#DC2626;color:#FEF2F2;}
+    .status-pill.verified {background:#16A34A;color:#F0FDF4;}
+    .status-pill.unresolved {background:#6B7280;color:#F9FAFB;}
     </style>
     """,
     unsafe_allow_html=True,
@@ -246,8 +361,51 @@ def metric_box(col, label, value):
     )
 
 
+def render_component_card(result):
+    status = result["status"]
+    css_class = "blocked" if status == "blocked" else ("verified" if status == "verified" else "unresolved")
+    pill_label = {"blocked": "Blocked", "verified": "Verified", "insufficient": "Unresolved", "no_measurements": "No Data"}[status]
+
+    st.markdown(
+        f"<div class='component-card {css_class}'>"
+        f"<div class='component-title'>{result['name']}"
+        f"<span class='status-pill {css_class}'>{pill_label}</span></div>",
+        unsafe_allow_html=True,
+    )
+
+    if status in ("blocked", "verified"):
+        unit_suffix = f" {result['mat_unit']}" if result.get("mat_unit") else ""
+        lowest = result["lowest"]
+        lowest_unit = f" {lowest['unit']}" if lowest.get("unit") else ""
+        c1, c2, c3 = st.columns(3)
+        metric_box(c1, "Discovered Minimum Limit", f"{result['mat']:.4f}{unit_suffix}")
+        metric_box(c2, "Lowest Floor Reading", f"{lowest['location_label']}: {lowest['value']:.4f}{lowest_unit}")
+        metric_box(c3, "True Margin", f"{result['margin']:+.4f}")
+        if result.get("calc_note"):
+            st.info(result["calc_note"])
+
+        if status == "blocked":
+            st.markdown("**Engineering remediation steps:**")
+            for step in remediation_steps(result["name"]):
+                st.markdown(f"- {step}")
+
+    elif status == "insufficient":
+        st.write("Cannot compute a margin for this component — missing:")
+        for name in result["missing_vars"]:
+            st.markdown(f"- ❌ **{name}**")
+        readings = result.get("ut_measurements") or []
+        if readings:
+            labels = ", ".join(f"{r['location_label']}={r['value']}" for r in readings)
+            st.caption(f"Readings on file for this component: {labels}")
+
+    else:  # no_measurements
+        st.write("A limit is on file for this component, but no UT readings were extracted for it.")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
 st.title("🛠️ TraceLink AI — Real AI Mode")
-st.caption(f"Structured extraction via the Anthropic API ({MODEL_NAME}). No local parsing logic.")
+st.caption(f"Structured, multi-component extraction via the Anthropic API ({MODEL_NAME}).")
 
 client = get_client()
 if client is None:
@@ -280,50 +438,31 @@ if uploaded is not None:
         st.error(st.session_state["api_error"])
         st.stop()
 
-    extracted = extract_with_claude(client, report_text)
-    st.session_state["extracted"] = extracted
-    result = evaluate(extracted)
+    extracted = st.session_state["extracted"]
+    outcome = evaluate(extracted)
 
     st.subheader("📋 Data Extracted From the Inspection Report")
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     metric_box(c1, "Asset Category", extracted.get("asset_category") or "Not stated")
     metric_box(c2, "Metallurgy", extracted.get("metallurgy") or "Not stated")
+    metric_box(c3, "Pressurized Piping", "Yes" if extracted.get("is_pressurized_piping") else "No")
 
-    if result["status"] == "insufficient":
-        st.warning("**CONDITION UNVERIFIED — INSUFFICIENT BOUNDARY DATA INPUTS**")
-        st.write("No MAT/threshold was stated, and these variables needed to calculate one "
-                 "are also missing from the report:")
-        for name in result["missing_vars"]:
-            st.markdown(f"- ❌ **{name}**")
+    st.markdown("---")
+
+    gs = outcome["global_status"]
+    if gs == "no_components":
+        st.warning("No sub-components were extracted from this report.")
+    elif gs == "BLOCKED":
+        names = ", ".join(r["name"] for r in outcome["blocked"])
+        st.error(f"🔴 **CRITICAL BOUNDARY DEFECT — COMPLIANCE STATUS: BLOCKED**\n\nBreaching component(s): {names}")
+    elif gs.startswith("CONDITION NOT FULLY VERIFIED"):
+        st.warning(f"🟡 **COMPLIANCE STATUS: {gs}**")
     else:
-        m1, m2, m3 = st.columns(3)
-        metric_box(m1, "Safety Ceiling (MAT)", f"{result['mat']:.4f}")
-        if result["status"] != "no_measurements":
-            metric_box(m2, "Lowest Reading", f"{result['lowest_label']}: {result['lowest_val']:.4f}")
-            metric_box(m3, "Margin", f"{result['margin']:+.4f}")
+        st.success("🟢 **COMPLIANCE STATUS: VERIFIED SECURE**")
 
-        if result.get("calc_note"):
-            st.info(result["calc_note"])
-
-        if result["status"] == "blocked":
-            st.error("🔴 **CRITICAL BOUNDARY DEFECT — COMPLIANCE STATUS: BLOCKED**")
-            st.markdown(
-                "- Lowest captured reading is below the safety ceiling.\n"
-                "- Component is BLOCKED from continued service pending engineering disposition.\n"
-                "- Route to Fitness-for-Service (FFS) / Authorized Inspector review."
-            )
-        elif result["status"] == "verified":
-            st.success("🟢 **COMPLIANCE STATUS: VERIFIED SECURE**")
-            st.markdown("- All captured readings are at or above the safety ceiling. Continue routine monitoring.")
-        elif result["status"] == "no_measurements":
-            st.warning("A safety ceiling was determined, but no UT/measurement readings were extracted from this report.")
-
-    ut_readings = extracted.get("ut_readings") or {}
-    if ut_readings:
-        with st.expander(f"Full UT reading dictionary — {len(ut_readings)} point(s)"):
-            for label, entry in sorted(ut_readings.items(), key=lambda kv: kv[1]["value"]):
-                unit = f" {entry['unit']}" if entry.get("unit") else ""
-                st.write(f"- {label}: {entry['value']}{unit}")
+    st.subheader("🧩 Component-Level Results")
+    for result in outcome["results"]:
+        render_component_card(result)
 
     anomalies = extracted.get("field_anomalies") or []
     if anomalies:
@@ -333,6 +472,19 @@ if uploaded is not None:
 
     with st.expander("Raw structured response from the model"):
         st.json(extracted)
+
+    with st.expander("Reference standard definitions"):
+        st.markdown(
+            "- **ASME B31.3** — Process Piping code; defines the pressure-design wall-thickness "
+            "formula used as the fallback calculation when a piping component has no stated limit.\n"
+            "- **API 579-1/ASME FFS-1** — Fitness-for-Service; used to assess whether a "
+            "locally thinned component can remain in service and under what conditions.\n"
+            "- **API 653** — In-service inspection, repair, and reconstruction of atmospheric "
+            "storage tanks.\n"
+            "- **Minimum Allowable Thickness (MAT)** — The lowest thickness at which a "
+            "component still meets its design-basis strength/pressure requirement; readings "
+            "below this value indicate a breach requiring engineering disposition."
+        )
 
 else:
     st.info("Upload a .txt inspection report above to run extraction.")
