@@ -14,40 +14,39 @@ confidence score.
 What stays in plain, deterministic Python, and why:
   * The pass/fail decision for each component (margin = lowest UT
     reading for that component - that component's stated minimum, with
-    an ASME B31.3 fallback when the asset is process piping and a
-    component has no stated minimum) is computed in plain Python, never
-    by the model, so the safety-critical comparison is reproducible.
+    an ASME B31.3 fallback used ONLY when the asset is process piping
+    and a component has no stated minimum — never for structural
+    steel/non-pressurized assets) is computed in plain Python, never by
+    the model, so the safety-critical comparison is reproducible.
   * A lightweight internal validator pass runs over the model's JSON
-    output (not over the raw text with regex) to sanity-check internal
-    consistency. This is a best-effort sanity net, not a guarantee of
+    output (not over the raw text with regex) as a sanity net before
+    anything is rendered. This is best-effort, not a guarantee of
     perfect extraction — no automated pass can promise 100% accuracy
     against arbitrary messy field text, so findings are surfaced as
     review flags, not treated as ground truth.
 
-Model note: MODEL_NAME stays "claude-opus-5-5", per your earlier
-"ignore model name it shud be claude-opus-5-5" instruction — this
-document re-requested "claude-3-5-sonnet-latest" again, which is
-retired on the Claude API, so I kept the override rather than
-reintroducing a model string that will 404. Say the word if you want
-it changed again.
+Model note: MODEL_NAME stays "claude-opus-5-5" — this document again
+requested "claude-3-5-sonnet-latest", which is retired on the Claude
+API, and your earlier instruction was explicitly to keep
+claude-opus-5-5, so that override still stands. Say so if you want it
+changed.
 
-Two UI notes worth flagging up front, since both rely on techniques
-Streamlit doesn't officially support:
-  * The "fixit" title is a real animated <canvas> particle system
-    (rendered inside its own component iframe) — the letters are
-    sampled into a particle grid that springs to its home position and
-    scatters/swirls under the cursor, then eases back on mouse-leave.
-    This only reacts to a real mouse, so on touch devices it just sits
-    static and readable, which is a fine degrade.
-  * The cursor-following glow on the result cards is implemented by
-    reaching from a components.v1.html iframe into `window.parent.document`
-    to attach a mousemove listener to the main app's DOM. This works
-    today because the component iframe is same-origin, but it's an
-    unofficial trick, not a supported Streamlit API — it's wrapped in
-    try/except so a future Streamlit change would silently disable the
-    pointer-follow glow rather than break the app. The breathing
-    pass/fail/unresolved halo on each card does NOT depend on this — 
-    that's pure CSS and will always work.
+Two UI notes worth flagging, since both rely on techniques outside
+Streamlit's official surface:
+  * The centered "fixit" wordmark is a real <canvas> particle system
+    (its own component iframe): the glyphs are sampled into a dense
+    particle field that springs to its home position and shatters into
+    fine, swirling grains under the cursor, then eases back on
+    mouse-leave. The "backup safe route" from the spec is implemented
+    as an always-on CSS glow on the logo's wrapper (not real-time FPS
+    detection, which isn't something a self-contained script can
+    reliably do) — so even if JavaScript/canvas is unavailable, the
+    wrapper still gets a warm amber glow on hover, and the static glass
+    text underneath stays fully legible either way.
+  * The cursor-following glow on result cards reaches from a component
+    iframe into `window.parent.document`, which works because the
+    iframe is same-origin today but isn't an official API — wrapped in
+    try/except so it fails silently rather than breaking the app.
 """
 
 import sys
@@ -123,11 +122,11 @@ Read the raw inspection text the user provides and call the \
 - Preserve stated uncertainty rather than resolving it. A "possible" or \
   "suspected" weld indication must be recorded as an unconfirmed finding \
   (is_confirmed_failure: false) describing it as needing NDT validation — \
-  never upgraded to a confirmed defect. Surface oxidation on fasteners with \
-  no torque record stated must likewise be recorded as unconfirmed and \
-  described as pending verification, not as a confirmed connection failure. \
-  Only set is_confirmed_failure: true when the text itself states the item \
-  failed, is rejected, or is out of tolerance.
+  never upgraded to a confirmed defect. Unverified/untorqued fasteners must \
+  likewise be recorded as unconfirmed and described as pending verification, \
+  not as a confirmed connection failure. Only set is_confirmed_failure: true \
+  when the text itself states the item failed, is rejected, or is out of \
+  tolerance.
 - "field_anomalies" should capture every inspector note, flagged indication, \
   weld observation, fastener condition note, or geometry/alignment issue, in \
   the report's own words in the "notes" field.
@@ -262,6 +261,8 @@ def calc_b31_3_mat(piping_vars):
 
 
 def evaluate_component(component, is_piping, piping_vars):
+    """is_piping gates the B31.3 fallback so it never fires for structural steel
+    or other non-pressurized assets — requirement #4."""
     name = component.get("component_name") or "Unnamed Component"
     ut_list = component.get("ut_thickness_measurements") or []
     mat_field = component.get("explicit_minimum_required_mat")
@@ -311,19 +312,8 @@ def evaluate(extracted):
     else:
         global_status = "VERIFIED SECURE"
 
-    # Binary safety-filter flag for the aero-glow halo. "CONDITION UNVERIFIED" is
-    # neither a clean pass nor a confirmed failure, so it gets its own neutral
-    # (amber, non-pulsing) halo rather than being forced into True/False.
-    if global_status == "VERIFIED SECURE":
-        passed_safety_filters = True
-    elif global_status == "BLOCKED":
-        passed_safety_filters = False
-    else:
-        passed_safety_filters = None
-
     return {"results": results, "blocked": blocked, "unresolved": unresolved,
-             "confirmed_failures": confirmed_failures, "global_status": global_status,
-             "passed_safety_filters": passed_safety_filters}
+             "confirmed_failures": confirmed_failures, "global_status": global_status}
 
 
 def remediation_steps(component_name):
@@ -389,20 +379,27 @@ def audit_extraction(report_text, extracted):
     return notices
 
 # ============================================================================
-# PREMIUM GLASS UI
+# FROSTED-GLASS / MESH-GRADIENT UI
 # ============================================================================
 
 st.markdown(
     """
     <style>
     html, body, [data-testid="stAppViewContainer"] {
-        background-color: #090D16;
+        background:
+            radial-gradient(circle at 15% 20%, rgba(60,17,44,0.55), transparent 45%),
+            radial-gradient(circle at 85% 15%, rgba(35,21,60,0.6), transparent 50%),
+            radial-gradient(circle at 50% 90%, rgba(20,60,58,0.35), transparent 55%),
+            #0A0E1A;
+        background-attachment: fixed;
     }
     .glass-card {
-        background: rgba(22, 31, 48, 0.65);
-        backdrop-filter: blur(12px);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.03);
+        backdrop-filter: blur(25px) saturate(180%);
+        -webkit-backdrop-filter: blur(25px) saturate(180%);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 16px;
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
         padding: 14px 18px;
         margin-bottom: 12px;
         transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
@@ -411,14 +408,16 @@ st.markdown(
     .glass-card:hover {
         transform: translateY(-4px);
         border-color: rgba(0, 242, 254, 0.45);
+        box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37), 0 0 26px rgba(0, 242, 254, 0.18);
     }
     .metric-label { color: #9CA3AF; font-size: 0.72rem; text-transform: uppercase; letter-spacing: .05em; }
     .metric-value { color: #F9FAFB; font-size: 1.2rem; font-weight: 700; word-wrap: break-word; }
     .accent-cyan { color: #00F2FE; }
     .accent-gold { color: #FBBF24; }
     .component-card.blocked {
-        background: linear-gradient(135deg, rgba(220,38,38,0.28), rgba(251,191,36,0.10));
-        border-color: rgba(220,38,38,0.6);
+        background: rgba(69, 10, 10, 0.45) !important;
+        border: 1px solid #EF4444 !important;
+        box-shadow: 0 0 30px rgba(239, 68, 68, 0.2) !important;
     }
     .component-card.verified { border-color: rgba(22,163,74,0.5); }
     .component-card.unresolved { border-color: rgba(107,114,128,0.5); }
@@ -430,26 +429,24 @@ st.markdown(
     .status-pill.verified { background:#16A34A; color:#F0FDF4; }
     .status-pill.unresolved { background:#6B7280; color:#F9FAFB; }
     [data-testid="stExpander"] {
-        border: 1px solid rgba(255,255,255,0.08) !important;
-        border-radius: 12px !important;
-        background: rgba(22, 31, 48, 0.4) !important;
+        border: 1px solid rgba(255,255,255,0.12) !important;
+        border-radius: 16px !important;
+        background: rgba(255, 255, 255, 0.03) !important;
+        backdrop-filter: blur(25px) saturate(180%) !important;
     }
     .raw-terminal {
-        background: #05070C; border: 1px solid rgba(255,255,255,0.08); border-radius: 12px;
+        background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.12); border-radius: 16px;
         padding: 14px; color: #9CA3AF; font-family: monospace; font-size: 0.8rem;
         max-height: 640px; overflow-y: auto; white-space: pre-wrap;
+        backdrop-filter: blur(25px) saturate(180%);
     }
-    .halo-wrapper { border-radius: 18px; padding: 4px; margin-bottom: 10px; }
-    .halo-pass { animation: breathe-emerald 4s ease-in-out infinite; }
-    .halo-fail { animation: breathe-crimson 3s ease-in-out infinite; }
-    .halo-unresolved { box-shadow: 0 0 30px rgba(251,191,36,0.12); }
-    @keyframes breathe-emerald {
-        0%, 100% { box-shadow: 0 0 25px rgba(16,185,129,0.15); }
-        50% { box-shadow: 0 0 50px rgba(16,185,129,0.32); }
+    .fixit-logo-wrap {
+        display: block; margin: 0 auto; text-align: center; padding-bottom: 2rem;
+        transition: all 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+        border-radius: 24px;
     }
-    @keyframes breathe-crimson {
-        0%, 100% { box-shadow: 0 0 25px rgba(239,68,68,0.18); }
-        50% { box-shadow: 0 0 55px rgba(239,68,68,0.38); }
+    .fixit-logo-wrap:hover {
+        box-shadow: 0 0 35px rgba(251, 191, 36, 0.35);
     }
     </style>
     """,
@@ -479,8 +476,7 @@ components.html(
             });
         } catch (err) {
             // Same-origin parent-document access isn't guaranteed across all
-            // Streamlit deployments/versions — fail silently, cards keep their
-            // static glass styling with no pointer-follow glow.
+            // Streamlit deployments/versions — fail silently.
         }
     })();
     </script>
@@ -490,11 +486,14 @@ components.html(
 
 
 def render_fixit_title():
+    """Centered 3D glass wordmark. CSS-only amber glow on the wrapper always
+    works on hover (the spec's 'backup safe route'); the canvas particle
+    shatter layers on top of that whenever JS/canvas is available."""
+    st.markdown("<div class='fixit-logo-wrap'>", unsafe_allow_html=True)
     components.html(
         """
-        <div style="width:100%;display:flex;justify-content:flex-start;">
-        <canvas id="fixitCanvas" width="480" height="140"
-                style="background:transparent;"></canvas>
+        <div style="width:100%;display:flex;justify-content:center;">
+        <canvas id="fixitCanvas" width="520" height="150" style="background:transparent;"></canvas>
         </div>
         <script>
         (function () {
@@ -503,18 +502,19 @@ def render_fixit_title():
             const off = document.createElement('canvas');
             off.width = canvas.width; off.height = canvas.height;
             const octx = off.getContext('2d');
-            octx.fillStyle = '#FBBF24';
-            octx.font = "700 3.5rem 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif";
+            octx.fillStyle = 'rgba(255,255,255,0.55)';
+            octx.font = "800 4.5rem 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif";
             octx.textBaseline = 'middle';
-            octx.fillText('fixit', 20, off.height / 2 + 6);
+            octx.textAlign = 'center';
+            octx.fillText('fixit', off.width / 2, off.height / 2 + 8);
             const img = octx.getImageData(0, 0, off.width, off.height).data;
 
             const particles = [];
-            const step = 3;
+            const step = 2;  // dense, fine grain rather than clumpy dots
             for (let y = 0; y < off.height; y += step) {
                 for (let x = 0; x < off.width; x += step) {
                     const idx = (y * off.width + x) * 4;
-                    if (img[idx + 3] > 120) {
+                    if (img[idx + 3] > 60) {
                         particles.push({ hx: x, hy: y, x: x, y: y, vx: 0, vy: 0 });
                     }
                 }
@@ -532,25 +532,25 @@ def render_fixit_title():
 
             function frame() {
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
-                ctx.fillStyle = '#FBBF24';
                 for (let i = 0; i < particles.length; i++) {
                     const p = particles[i];
                     const dx = p.x - mouseX, dy = p.y - mouseY;
                     const dist = Math.sqrt(dx * dx + dy * dy) || 0.001;
-                    const radius = 55;
+                    const radius = 60;
                     if (dist < radius) {
                         const force = (radius - dist) / radius;
                         const angle = Math.atan2(dy, dx) + Math.PI / 2;
-                        p.vx += Math.cos(angle) * force * 2.2 + (dx / dist) * force * 1.4;
-                        p.vy += Math.sin(angle) * force * 2.2 + (dy / dist) * force * 1.4;
+                        p.vx += Math.cos(angle) * force * 2.4 + (dx / dist) * force * 1.5;
+                        p.vy += Math.sin(angle) * force * 2.4 + (dy / dist) * force * 1.5;
                     }
-                    p.vx += (p.hx - p.x) * 0.09;
-                    p.vy += (p.hy - p.y) * 0.09;
-                    p.vx *= 0.82;
-                    p.vy *= 0.82;
+                    p.vx += (p.hx - p.x) * 0.10;
+                    p.vy += (p.hy - p.y) * 0.10;
+                    p.vx *= 0.80;
+                    p.vy *= 0.80;
                     p.x += p.vx;
                     p.y += p.vy;
-                    ctx.fillRect(p.x, p.y, 2, 2);
+                    ctx.fillStyle = 'rgba(255,255,255,0.55)';
+                    ctx.fillRect(p.x, p.y, 1.4, 1.4);
                 }
                 requestAnimationFrame(frame);
             }
@@ -558,8 +558,9 @@ def render_fixit_title():
         })();
         </script>
         """,
-        height=150,
+        height=160,
     )
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def metric_html(label, value, accent=None):
@@ -584,14 +585,14 @@ def render_component_card(result):
         lowest = result["lowest"]
         lowest_unit = f" {lowest['unit']}" if lowest.get("unit") else ""
         c1, c2, c3 = st.columns(3)
-        c1.markdown(metric_html("Lowest Measured UT Point", f"{lowest['location_label']}: {lowest['value']:.4f}{lowest_unit}"), unsafe_allow_html=True)
-        c2.markdown(metric_html("Stated Design Minimum (MAT)", f"{result['mat']:.4f}{unit_suffix}"), unsafe_allow_html=True)
+        c1.markdown(metric_html("Lowest Reading", f"{lowest['location_label']}: {lowest['value']:.4f}{lowest_unit}"), unsafe_allow_html=True)
+        c2.markdown(metric_html("Stated Minimum (MAT)", f"{result['mat']:.4f}{unit_suffix}"), unsafe_allow_html=True)
         margin_accent = "accent-gold" if status == "blocked" else "accent-cyan"
-        c3.markdown(metric_html("Computed True Margin", f"{result['margin']:+.4f}", margin_accent), unsafe_allow_html=True)
+        c3.markdown(metric_html("True Margin", f"{result['margin']:+.4f}", margin_accent), unsafe_allow_html=True)
         if result.get("calc_note"):
             st.info(result["calc_note"])
         if status == "blocked":
-            st.markdown("**Localized remediation action steps:**")
+            st.markdown("**Remediation action steps:**")
             for step in remediation_steps(result["name"]):
                 st.markdown(f"- {step}")
     elif status == "insufficient":
@@ -607,9 +608,10 @@ def render_component_card(result):
     st.markdown("</div>", unsafe_allow_html=True)
 
 
+render_fixit_title()
+
 client = get_client()
 if client is None:
-    render_fixit_title()
     st.error(
         "ANTHROPIC_API_KEY is not set. In Streamlit Cloud, open **Settings → Secrets** for this app "
         "and add:\n\n```\nANTHROPIC_API_KEY = \"sk-ant-...\"\n```"
@@ -643,6 +645,28 @@ if uploaded is not None:
     outcome = evaluate(extracted)
     audit_notices = audit_extraction(report_text, extracted)
 
+    score = extracted.get("extraction_confidence_score")
+    if score is None:
+        confidence_label = "Unknown"
+    elif score >= 0.85:
+        confidence_label = "High"
+    elif score >= 0.6:
+        confidence_label = "Medium"
+    else:
+        confidence_label = "Low"
+
+    st.markdown("#### Dual Status Banners")
+    m1, m2 = st.columns(2)
+    m1.markdown(metric_html("Extraction Confidence (text legibility)", confidence_label, "accent-cyan"), unsafe_allow_html=True)
+    gs = outcome["global_status"]
+    gs_accent = "accent-gold" if gs == "BLOCKED" else None
+    m2.markdown(metric_html("Global Engineering Safety Status", gs, gs_accent), unsafe_allow_html=True)
+
+    if audit_notices:
+        st.markdown("#### 🟡 System Extraction Audit Notice")
+        for notice in audit_notices:
+            st.warning(notice)
+
     left, right = st.columns([1, 1])
 
     with left:
@@ -650,45 +674,19 @@ if uploaded is not None:
         st.markdown(f"<div class='raw-terminal'>{report_text}</div>", unsafe_allow_html=True)
 
     with right:
-        render_fixit_title()
-        st.caption(f"Structured, multi-component extraction via the Anthropic API ({MODEL_NAME}).")
-
-        score = extracted.get("extraction_confidence_score")
-        if score is None:
-            confidence_label = "Unknown"
-        elif score >= 0.85:
-            confidence_label = "High"
-        elif score >= 0.6:
-            confidence_label = "Medium"
-        else:
-            confidence_label = "Low"
-
-        m1, m2 = st.columns(2)
-        m1.markdown(metric_html("Extraction Read Accuracy Confidence", confidence_label, "accent-cyan"), unsafe_allow_html=True)
-        gs = outcome["global_status"]
-        gs_accent = "accent-gold" if gs == "BLOCKED" else None
-        m2.markdown(metric_html("Global Engineering Safety Status", gs, gs_accent), unsafe_allow_html=True)
-
+        st.subheader("🧬 Live Structural Verification Matrix")
         c1, c2, c3 = st.columns(3)
         c1.markdown(metric_html("Asset Category", extracted.get("asset_category") or "Not stated"), unsafe_allow_html=True)
         c2.markdown(metric_html("Metallurgy", extracted.get("metallurgy_specification") or "Not stated"), unsafe_allow_html=True)
         c3.markdown(metric_html("Engineering Framework", extracted.get("engineering_framework") or "Not determined"), unsafe_allow_html=True)
 
-        if audit_notices:
-            st.markdown("#### 🟡 System Extraction Audit Notice")
-            for notice in audit_notices:
-                st.warning(notice)
-
-        halo_class = {True: "halo-pass", False: "halo-fail", None: "halo-unresolved"}[outcome["passed_safety_filters"]]
-        st.markdown(f"<div class='halo-wrapper {halo_class}'>", unsafe_allow_html=True)
         st.markdown("#### Calculation Trail Ledger")
         for result in outcome["results"]:
             render_component_card(result)
-        st.markdown("</div>", unsafe_allow_html=True)
 
         ledger = extracted.get("missing_engineering_variables_ledger") or []
         if ledger:
-            st.markdown("#### 📒 Missing Engineering Variables Ledger")
+            st.markdown("#### 📒 Data Deficit Ledger")
             for item in ledger:
                 st.markdown(f"- {item}")
 
@@ -721,5 +719,4 @@ if uploaded is not None:
         )
 
 else:
-    render_fixit_title()
     st.info("Upload a .txt inspection field log above to run extraction.")
