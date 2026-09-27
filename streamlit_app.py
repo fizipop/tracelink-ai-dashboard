@@ -155,7 +155,7 @@ EXTRACTION_TOOL = {
 
 
 def extract_with_claude(client, report_text):
-    """Send the report to Claude and let it use the extraction tool."""
+    """Send the report to Claude and return the structured extraction as a Python dict."""
     response = client.messages.create(
         model=MODEL_NAME,
         max_tokens=2000,
@@ -163,6 +163,13 @@ def extract_with_claude(client, report_text):
         tools=[EXTRACTION_TOOL],
         messages=[{"role": "user", "content": report_text}],
     )
+
+    # Find Claude's tool-use response
+    for block in response.content:
+        if block.type == "tool_use" and block.name == "extract_compliance_data":
+            return block.input
+
+    raise ValueError("Claude did not return the expected extraction tool result.")
 
     return response
     for block in response.content:
