@@ -1,4 +1,2 @@
-# Fresh Environment Invalidation
-anthropic
-pydantic
-streamlit
+streamlit>=1.35
+anthropic>=0.34
