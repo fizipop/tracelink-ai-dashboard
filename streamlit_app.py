@@ -70,6 +70,17 @@ before):
     always kept as open, unconfirmed items pending secondary
     verification, never upgraded to a confirmed defect.
 
+REFACTOR (units / component types / precedence / master records):
+  * Every reading keeps the unit printed on its own row; a document-wide unit
+    is only a flagged last resort (see _parse_reading_list).
+  * audit_and_reconcile() runs after parsing and before any margin is
+    computed: dual-unit normalization, tube unit sanity check (> 0.500 in
+    => mm misidentified), signed-addendum supersession, repair-pad linkage,
+    unit-aware historical reconciliation (<= 1% after conversion), and MAT
+    binding by component_type (tube MAT is never the shell MAT).
+  * build_master_records() emits ONE consolidated record per physical
+    component (S1..S6, T1..T4) with its full lineage and verified calculation.
+
 Model note: MODEL_NAME stays "claude-opus-5-5" per your standing
 instruction.
 
@@ -372,24 +383,33 @@ def get_client():
 # ----------------------------------------------------------------------------
 FLAT_MANIFEST_FORMAT_SPEC = """\
 Component: <component name, exactly as named or clearly implied in the text>
-MAT: <numeric stated minimum, only if explicitly stated — omit this whole line if none is stated>
-Unit: <unit string, e.g. in, mm — MANDATORY whenever MAT or any UT/Historical_UT reading is stated for
-  this component. A bare number with no unit is not usable downstream, so if the text states a
-  component-specific minimum or reading but truly never states a unit anywhere near it, do not omit
-  this line silently — instead state the asset's global/document-wide unit if one is stated elsewhere
-  in the text (e.g. the report's header says all thicknesses are in inches), or, failing that, add a
-  MISSING_INFORMATION field_anomaly noting the value has no recoverable unit.>
+Component_Type: <MANDATORY. One of: shell, tube, channel, flange, head, nozzle, support, plate, other. The
+  physical sub-component class. Tube bundle / tube wall / heating coil / T1..Tn = "tube"; shell course /
+  shell cylinder / S1..Sn = "shell". Tubes and shells have DIFFERENT minimum allowable thicknesses.>
+MAT: <numeric stated minimum FOR THIS COMPONENT'S OWN CLASS, only if explicitly stated — omit this whole line if none is stated. Never copy the shell MAT onto a tube.>
+Unit: <unit of the MAT value ONLY (in or mm). It is NOT a default for the readings — every reading carries its own unit (see UT lines).>
 MAT_Authority_Tier: <one of the six source-precedence tiers below — omit if MAT is omitted>
 MAT_Source: <the specific document/section the minimum came from, e.g. "Design / Operating Information" — omit if unknown>
 MAT_General_Criterion: <numeric value of a general/default criterion this minimum overrides, if the text gives both a general and a special-case number — omit if not applicable>
 MAT_Reason: <one short sentence on why this minimum (vs. any other candidate number in the text) was selected — omit if there was only one candidate number>
-UT: <label>=<value>, <label>=<value>, ...   (omit this whole line if no current readings exist)
+Attached_Reinforcement: pad_thickness=<number> <unit>; pressure_retaining=false   (omit unless a repair pad / reinforcement plate / doubler is attached to THIS component; the base-shell readings still go on the UT/Reading_Set lines, the pad thickness goes ONLY here)
+Reading_Set: <document_type> | <document_date, ISO YYYY-MM-DD if possible, else as written> | <signed_addendum: yes/no> | <source document name> | <label>=<value> <unit>, <label>=<value> <unit>, ...
+  (one line PER DOCUMENT that gives current-cycle readings for this component. If a signed addendum / re-run and an
+   earlier final report BOTH give readings for the same component, emit two Reading_Set lines — never pick or merge
+   them yourself; Python applies supersession. Example:
+   Reading_Set: Final Inspection Report | 2026-09-28 | no | Final Inspection Report - Sept 28 | S3=9.45 mm
+   Reading_Set: Signed Addendum | 2026-09-30 | yes | Signed Addendum - Sept 30 | S3-A=9.61 mm, S3-B=9.58 mm)
+UT: <label>=<value> <unit>, ...   (legacy single-source form of Reading_Set — use it only when exactly one document gives readings; omit if none. Every reading MUST carry its own unit.)
 UT_Authority_Tier: <one of the six source-precedence tiers below, for the current UT readings — omit if UT is omitted>
 UT_Source: <the specific document/section the current readings came from — omit if unknown>
 UT_Source_Date: <date of that reading, if stated — omit if unknown>
 UT_All_Values_In_Region: <every candidate value the text gave for this same location/region, comma-separated, if more than one was mentioned — omit if there was only one>
 UT_Reason: <one short sentence on why the selected lowest reading (vs. other candidates in the region) was chosen — omit if there was only one candidate>
-Historical_UT: <label>=<value>, ...          (omit this whole line if no prior-inspection readings exist)
+Historical_Set: <date, YYYY-MM-DD or year> | <source document name / kind, e.g. "Signed 2024 report" or "2024 spreadsheet"> | <label>=<value> <unit>, ...
+  (one line PER source of prior-inspection readings. If the same historical reading appears in two sources in
+   different units — e.g. 0.402 in in a spreadsheet and 10.20 mm in a signed report — emit BOTH lines with each
+   source's own printed unit; never convert or de-duplicate yourself. Python reconciles them.)
+Historical_UT: <label>=<value> <unit>, ...   (legacy single-source form of Historical_Set — omit if no prior-inspection readings exist)
 Component_End
 
 Repeat one such block per component, separated by a blank line. Use a
@@ -434,6 +454,15 @@ changes which calculation it feeds):
     the post-prep number and silently drop the pre-prep number, and never
     merge the two into a single averaged or "best" value — both must
     appear as separate entries on the UT: line.
+
+UNIT / TYPE / PAD RULES THAT DRIVE DOWNSTREAM SAFETY LOGIC:
+  * EVERY reading carries its own unit right after the number ("9.45 mm",
+    "0.072 in"). Never copy the document-wide unit onto a row that shows a
+    different one, and never convert values yourself.
+  * Component_Type is mandatory on every block; tubes and shells never share
+    a MAT.
+  * A repair pad's thickness goes only on Attached_Reinforcement, never on the
+    base-shell reading lines.
 
 SOURCE PRECEDENCE TIERS (highest authority first — use these exact strings
 for any _Authority_Tier line, and never let a lower tier silently overwrite
@@ -495,6 +524,41 @@ Read the raw inspection text the user provides and call the \
   both sources in the "notes" field, and still select the higher of the two \
   values as a conservative placeholder in the manifest so downstream \
   calculations do not silently under-report risk.
+- UNIT RULE (highest-priority rule for every measurement): every reading in \
+  a UT:/Reading_Set:/Historical_Set:/Historical_UT: line, and every MAT or pad \
+  thickness, MUST carry its own unit written directly after the number \
+  (e.g. "9.45 mm", "0.072 in"). Take the unit from the nearest explicit \
+  marker for THAT row/cell — the cell text itself, then that column header, \
+  then that table's caption — and only afterwards from a document-wide \
+  default. An explicit row/column unit marker ALWAYS overrides the \
+  document-wide default: if a header says "all thicknesses in inches" but a \
+  row or column is labeled mm, that row is mm. Record the value exactly as \
+  printed with its printed unit; never convert units yourself. If no unit is \
+  recoverable for a reading, write the number with no unit — never guess one.
+- COMPONENT TYPING: every Component block MUST include Component_Type \
+  (shell, tube, channel, flange, head, nozzle, support, plate, other). A \
+  heat exchanger has separate shell and tube components with different \
+  minimum allowable thicknesses; tag each correctly.
+- MAT BINDING: "global_minimum_allowable_thickness" is a SHELL-CLASS default \
+  and must never be used for tubes. Put every class-specific minimum in \
+  "component_mat_table" (one entry per component_type, e.g. tube = 0.070 in, \
+  shell = 0.375 in, each with value and unit). A component's own MAT: line is \
+  used only when the text states a minimum for that specific component.
+- DOCUMENT METADATA & SUPERSESSION: list every source document in \
+  "document_registry" (name, type such as Final Inspection Report / Signed \
+  Addendum / Re-run, date, and whether it is a signed addendum). When a signed \
+  addendum or re-run gives new readings for a component that an earlier report \
+  also covers, emit BOTH as separate Reading_Set lines with their own \
+  document metadata. Do not choose between them and do not delete the older \
+  one — supersession is applied afterward in Python.
+- HISTORICAL RECORDS: emit one Historical_Set line per source (e.g. a signed \
+  2024 report and a 2024 spreadsheet), each with its own printed unit, even \
+  when they appear to be the same physical reading in different units. Do not \
+  convert or de-duplicate; Python reconciles them by physical equivalence.
+- REPAIR PADS: if a reinforcement/repair pad is attached to a component, put \
+  the base pressure-retaining shell readings on the reading lines and the pad \
+  thickness ONLY on the Attached_Reinforcement line (pressure_retaining=false). \
+  Never place a pad thickness among the base-shell readings.
 - "global_minimum_allowable_thickness" is an asset-level (not per-component) \
   minimum thickness the text states applies to the whole vessel/asset by \
   default — e.g. a header or design-basis line reading "Minimum Allowable \
@@ -619,8 +683,9 @@ EXTRACTION_TOOL = {
                 "description": (
                     "Asset-level (document-wide) minimum allowable thickness, e.g. 'Minimum Allowable "
                     "Shell Thickness (MAT)', only if the text states one as a default applying to the "
-                    "whole asset rather than to one specific component. Automatically propagates into "
-                    "any component whose own per-component MAT is not separately stated."
+                    "whole asset rather than to one specific component. This is a SHELL-CLASS default: "
+                    "Python binds it to shell-class components only and NEVER to tubes (put tube and other "
+                    "class-specific minimums in component_mat_table)."
                 ),
                 "properties": {
                     "value": {"type": ["number", "null"]},
@@ -669,14 +734,52 @@ EXTRACTION_TOOL = {
                     "required": ["event_id", "is_duplicate_or_continuation"],
                 },
             },
+            "component_mat_table": {
+                "type": "array",
+                "description": (
+                    "Minimum allowable thickness per component CLASS (e.g. tube = 0.070 in, shell = "
+                    "0.375 in), exactly as the text states them. Python binds each component's MAT from "
+                    "this table by component_type, so a shell MAT is never applied to a tube. Every entry "
+                    "requires an explicit unit."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "component_type": {"type": "string", "enum": ["shell", "tube", "channel", "flange", "head", "nozzle", "support", "plate", "other"]},
+                        "value": {"type": "number"},
+                        "unit": {"type": "string", "enum": ["in", "mm"]},
+                        "source": {"type": ["string", "null"]},
+                    },
+                    "required": ["component_type", "value", "unit"],
+                },
+            },
+            "document_registry": {
+                "type": "array",
+                "description": (
+                    "Every distinct source document in the package with its type, date and whether it is a "
+                    "signed addendum. Python uses this for precedence (a signed addendum / re-run supersedes "
+                    "an earlier final report for the components it re-measured)."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "document_name": {"type": "string"},
+                        "document_type": {"type": "string"},
+                        "document_date": {"type": ["string", "null"], "description": "ISO YYYY-MM-DD if possible."},
+                        "is_signed_addendum": {"type": "boolean"},
+                        "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Component identifiers the document says it supersedes, e.g. S3, S5, T3."},
+                    },
+                    "required": ["document_name", "document_type", "is_signed_addendum"],
+                },
+            },
             "flat_manifest_block": {
                 "type": "string",
                 "description": (
-                    "Every component's data as plain marked-up text (Component: / MAT: / Unit: / "
-                    "MAT_Authority_Tier: / MAT_Source: / MAT_General_Criterion: / MAT_Reason: / UT: / "
-                    "UT_Authority_Tier: / UT_Source: / UT_Source_Date: / UT_All_Values_In_Region: / "
-                    "UT_Reason: / Historical_UT: / Component_End), one block per component. See system "
-                    "prompt for the exact grammar. This replaces a nested JSON components array."
+                    "Every component's data as plain marked-up text (Component: / Component_Type: / MAT: / "
+                    "Unit: / MAT_*: / Attached_Reinforcement: / Reading_Set: / UT: / UT_*: / Historical_Set: / "
+                    "Historical_UT: / Component_End), one block per physical component. EVERY reading and "
+                    "MAT value must carry its own unit (e.g. '9.45 mm'). See system prompt for the exact "
+                    "grammar. This replaces a nested JSON components array."
                 ),
             },
             "missing_engineering_variables_ledger": {
@@ -733,7 +836,7 @@ def _request_structured_extraction(client, report_text, system_prompt):
         # single flat string field can legitimately need more room on a
         # dense report than several small nested objects did, since there's
         # no per-object JSON scaffolding splitting up the budget anymore.
-        max_tokens=6000,
+        max_tokens=8000,  # raised: Reading_Set / Historical_Set lines make the manifest longer
         system=system_prompt,
         tools=[EXTRACTION_TOOL],
         tool_choice={"type": "auto"},
@@ -842,13 +945,53 @@ def _coerce_float(raw_value):
         return None
 
 
-def _parse_reading_list(line_value, fallback_unit):
-    """Parses a 'UT:' or 'Historical_UT:' line value into a list of
-    {location_label, value, unit} dicts. Accepts 'Label=value' pairs
-    (preferred) or bare comma-separated values (auto-labeled R1, R2, ...)."""
+_READING_UNIT_RE = re.compile(
+    r'(?P<num>[-+]?\d*\.?\d+)\s*(?P<unit>millimet\w*|mm\b|inch(?:es)?\b|in\b|")?',
+    re.IGNORECASE,
+)
+
+
+def _normalize_unit(raw):
+    """Maps any unit spelling to the canonical 'in' or 'mm'. Returns None for
+    anything unrecognized — an unrecognized unit is never guessed at."""
+    if raw is None:
+        return None
+    t = str(raw).strip().lower().strip(".")
+    if t in ("in", "inch", "inches", '"', "''"):
+        return "in"
+    if t in ("mm", "millimeter", "millimeters", "millimetre", "millimetres"):
+        return "mm"
+    return None
+
+
+def _split_value_unit(value_str):
+    """Pulls (number, canonical_unit_or_None) out of a reading token such as
+    '9.45 mm', '0.072in', or '0.402"'. The unit is whatever is printed next to
+    THIS number — never inherited from anywhere else."""
+    m = _READING_UNIT_RE.search(value_str or "")
+    if not m:
+        return None, None
+    try:
+        return float(m.group("num")), _normalize_unit(m.group("unit"))
+    except ValueError:
+        return None, None
+
+
+def _parse_reading_list(line_value, fallback_unit=None):
+    """Parses a reading list into [{location_label, value, unit, unit_source,
+    prep_phase, is_pad}] dicts. Accepts 'Label=value unit' pairs (required
+    form) or bare values (auto-labeled R1, R2, ...).
+
+    UNIT PRIORITY (row-level preservation): the unit printed on the reading
+    itself always wins (unit_source='row'). Only when the row carries no unit
+    does the block-level fallback_unit apply (unit_source='block_default');
+    the caller may then apply a document-wide default (unit_source=
+    'global_default'). Both inherited cases are flagged in parse notices and
+    still pass through the unit sanity check in audit_and_reconcile."""
     readings = []
     if not line_value:
         return readings
+    block_unit = _normalize_unit(fallback_unit)
     for i, part in enumerate([p.strip() for p in line_value.split(",")], start=1):
         if not part:
             continue
@@ -857,16 +1000,25 @@ def _parse_reading_list(line_value, fallback_unit):
             label = label.strip() or f"R{i}"
         else:
             label, value_str = f"R{i}", part
-        value = _coerce_float(value_str)
+        value, row_unit = _split_value_unit(value_str)
         if value is None:
             continue  # skip unparseable tokens rather than fabricate a reading
+        if row_unit:
+            unit, unit_source = row_unit, "row"
+        elif block_unit:
+            unit, unit_source = block_unit, "block_default"
+        else:
+            unit, unit_source = None, "none"
         if _label_matches(label, PRE_PREP_LABEL_HINTS):
             prep_phase = "pre"
         elif _label_matches(label, POST_PREP_LABEL_HINTS):
             prep_phase = "post"
         else:
             prep_phase = None
-        readings.append({"location_label": label, "value": value, "unit": fallback_unit, "prep_phase": prep_phase})
+        readings.append({
+            "location_label": label, "value": value, "unit": unit, "unit_source": unit_source,
+            "prep_phase": prep_phase, "is_pad": _label_matches(label, NON_BOUNDARY_LABEL_HINTS),
+        })
     return readings
 
 
@@ -914,27 +1066,47 @@ _PROVENANCE_LINE_MAP = {
 }
 
 
+def _split_pipe_fields(value, n):
+    """Splits a pipe-delimited manifest line into exactly n fields. If the model
+    supplied fewer metadata fields than expected, the LAST field (the readings)
+    stays last and the missing metadata is left blank at the front."""
+    parts = [p.strip() for p in (value or "").split("|", n - 1)]
+    while len(parts) < n:
+        parts.insert(0, "")
+    return parts
+
+
+_TRUTHY = ("yes", "true", "y", "1")
+
+
 def _parse_single_component_block(block_text, global_mat=None, notices=None):
     """Parses one 'Component: ... ' block (already stripped of its trailing
     Component_End marker) into the component dict shape evaluate_component()
-    expects, including optional decision-traceability metadata. Returns None
-    if the block has no recognizable component name.
+    expects. Returns None if the block has no recognizable component name.
 
-    global_mat, when provided, is the {"value", "unit"} dict extracted from
-    the document-wide "global_minimum_allowable_thickness" field. It is
-    propagated into this component's explicit_minimum_required_mat ONLY
-    when the component states no MAT of its own — a component's own stated
-    minimum always wins.
-
-    notices, when provided, collects human-readable strings for unit-
-    fallback and pad-isolation events, surfaced later as parse notices."""
+    REFACTOR NOTES:
+      * Every reading keeps the unit printed on its own row (see
+        _parse_reading_list). Nothing is defaulted to a document-wide unit
+        unless the row itself states none, and that case is flagged.
+      * Current readings are grouped into reading_sets, one per source
+        document (with document type/date/signed-addendum metadata), so
+        audit_and_reconcile can apply addendum supersession. Historical
+        readings are grouped into historical_sets the same way.
+      * MAT is NOT propagated from the document-wide value here. Binding a
+        MAT to a component happens in audit_and_reconcile, keyed on
+        component_type, so a shell MAT can never leak onto a tube.
+    """
     if notices is None:
         notices = []
     component_name = None
+    component_type = None
     mat_value = None
     mat_unit = None
     ut_line_value = None
     historical_line_value = None
+    attached_raw = None
+    reading_set_lines = []
+    historical_set_lines = []
     provenance_raw = {}
 
     for line in block_text.splitlines():
@@ -942,8 +1114,16 @@ def _parse_single_component_block(block_text, global_mat=None, notices=None):
         if not line:
             continue
         line_lower = line.lower()
-        if line_lower.startswith("component:"):
+        if line_lower.startswith("component_type:"):
+            component_type = line.split(":", 1)[1].strip() or None
+        elif line_lower.startswith("component:"):
             component_name = line.split(":", 1)[1].strip()
+        elif line_lower.startswith("attached_reinforcement:"):
+            attached_raw = line.split(":", 1)[1].strip()
+        elif line_lower.startswith("reading_set:"):
+            reading_set_lines.append(line.split(":", 1)[1])
+        elif line_lower.startswith("historical_set:"):
+            historical_set_lines.append(line.split(":", 1)[1])
         elif line_lower.startswith("mat_"):
             # Check the longer MAT_* provenance prefixes before the bare
             # "mat:" check below, since "mat_reason:" also starts with "mat".
@@ -968,70 +1148,91 @@ def _parse_single_component_block(block_text, global_mat=None, notices=None):
     if not component_name:
         return None
 
-    global_unit = (global_mat or {}).get("unit")
+    global_unit = _normalize_unit((global_mat or {}).get("unit"))
 
-    # Mandatory unit-pairing rule: a stated MAT value is never left with a
-    # NULL unit if any unit is recoverable anywhere in the document.
+    # Mandatory unit-pairing rule for the stated MAT value.
     if mat_value is not None:
-        mat_unit = _resolve_unit(mat_unit, global_unit, notices, f"'{component_name}' MAT value")
+        mat_unit = _resolve_unit(mat_unit, (global_mat or {}).get("unit"), notices, f"'{component_name}' MAT value")
 
-    ut_readings_all = _parse_reading_list(ut_line_value, mat_unit)
-    historical_readings = _parse_reading_list(historical_line_value, mat_unit)
+    # ---- current-cycle reading sets (one per source document) ----
+    reading_sets = []
+    if ut_line_value:
+        reading_sets.append({
+            "doc_type": provenance_raw.get("ut_authority_tier"),
+            "doc_date": provenance_raw.get("ut_source_date"),
+            "is_signed_addendum": False,
+            "source": provenance_raw.get("ut_source"),
+            "readings": _parse_reading_list(ut_line_value, mat_unit),
+        })
+    for raw in reading_set_lines:
+        dtype, ddate, signed, source, rd = _split_pipe_fields(raw, 5)
+        reading_sets.append({
+            "doc_type": dtype or None,
+            "doc_date": ddate or None,
+            "is_signed_addendum": signed.strip().lower() in _TRUTHY,
+            "source": source or None,
+            "readings": _parse_reading_list(rd, mat_unit),
+        })
 
-    # Belt-and-suspenders unit backstop: a reading can still come out with
-    # unit=None here if this block stated readings but no "Unit:" line at
-    # all (e.g. a historical-only block later merged into a component whose
-    # current-cycle block carried the unit). Never leave a parsed reading
-    # value paired with a NULL unit if the document-wide global unit can
-    # fill the gap.
-    if global_unit:
-        for reading in ut_readings_all + historical_readings:
-            if reading.get("value") is not None and not reading.get("unit"):
-                reading["unit"] = global_unit
-                notices.append(
-                    f"'{component_name}' reading '{reading['location_label']}' stated no unit of its "
-                    f"own — used the document-wide global MAT unit ('{global_unit}') as a fallback."
-                )
-    else:
-        for reading in ut_readings_all + historical_readings:
-            if reading.get("value") is not None and not reading.get("unit"):
-                notices.append(
-                    f"'{component_name}' reading '{reading['location_label']}' has no recoverable unit "
-                    "anywhere in the document — flagged as unusable pending verification."
-                )
+    # ---- historical sets (one per source document/kind) ----
+    historical_sets = []
+    if historical_line_value:
+        historical_sets.append({
+            "doc_date": None, "source": None,
+            "readings": _parse_reading_list(historical_line_value, mat_unit),
+        })
+    for raw in historical_set_lines:
+        hdate, hsource, rd = _split_pipe_fields(raw, 3)
+        historical_sets.append({
+            "doc_date": hdate or None, "source": hsource or None,
+            "readings": _parse_reading_list(rd, mat_unit),
+        })
 
-    # Pad/reinforcement readings are never blended into the base-shell
-    # reading list that margin calculations use — isolate them here so a
-    # passing pad reading can never mask a failing base-shell reading (and
-    # vice versa) at the same location.
-    ut_readings, pad_readings = _split_non_boundary_readings(ut_readings_all)
+    # Unit backstop: a reading with NO recoverable unit from its own row or the
+    # block gets the document-wide unit only as a flagged last resort.
+    all_readings = [r for s in reading_sets + historical_sets for r in s["readings"]]
+    unitless = [r for r in all_readings if not r.get("unit")]
+    if unitless:
+        if global_unit:
+            for r in unitless:
+                r["unit"], r["unit_source"] = global_unit, "global_default"
+        else:
+            notices.append(
+                f"'{component_name}': {len(unitless)} reading(s) have no recoverable unit anywhere in the "
+                "document — flagged as unusable pending verification."
+            )
+    inherited = [r for r in all_readings if r.get("unit_source") in ("block_default", "global_default")]
+    if inherited:
+        notices.append(
+            f"'{component_name}': {len(inherited)} reading(s) carried no unit on their own row, so a "
+            "block/document-wide default unit was inherited. The row-level unit is authoritative when "
+            "present — these inherited units are still checked by the unit sanity audit."
+        )
+
+    # Legacy flat lists (kept for compatibility; audit_and_reconcile rebuilds
+    # them from the sets after normalization/precedence).
+    current_all = [r for s in reading_sets for r in s["readings"]]
+    ut_readings, pad_readings = _split_non_boundary_readings(current_all)
     if pad_readings:
         notices.append(
             f"'{component_name}': isolated {len(pad_readings)} reinforcement/repair-pad reading(s) "
             "from the base-shell UT readings — evaluated separately per API 570."
         )
+    historical_readings = [r for s in historical_sets for r in s["readings"]]
 
-    # Global MAT propagation: only fires when this component stated no MAT
-    # of its own. A component's own explicit MAT/Unit lines always win.
-    mat_propagated_from_global = False
-    if mat_value is None and global_mat and global_mat.get("value") is not None:
-        mat_value = global_mat.get("value")
-        mat_unit = global_mat.get("unit")
-        mat_propagated_from_global = True
-        notices.append(
-            f"'{component_name}': no per-component MAT was stated — propagated the document-wide "
-            f"global MAT ({mat_value} {mat_unit or ''}).".strip()
-        )
+    attached = None
+    if attached_raw:
+        m = re.search(r'pad_thickness\s*=\s*([-+]?\d*\.?\d+)\s*(millimet\w*|mm\b|inch(?:es)?\b|in\b|")?',
+                      attached_raw, re.IGNORECASE)
+        if m:
+            attached = {
+                "pad_thickness": float(m.group(1)),
+                "unit": _normalize_unit(m.group(2)) or global_unit,
+                "is_pressure_retaining": bool(re.search(r"pressure_retaining\s*=\s*(true|yes)", attached_raw, re.IGNORECASE)),
+            }
 
     mat_provenance = None
-    if mat_propagated_from_global:
-        mat_provenance = {
-            "authority_tier": None,
-            "source": "Document-wide global MAT (propagated — no per-component minimum stated)",
-            "general_criterion": None,
-            "reason": "This component stated no minimum of its own; the document-wide global MAT was applied.",
-        }
-    elif any(k in provenance_raw for k in ("mat_authority_tier", "mat_source", "mat_general_criterion", "mat_reason")):
+    if any(k in provenance_raw for k in ("mat_authority_tier", "mat_source", "mat_general_criterion", "mat_reason")):
         mat_provenance = {
             "authority_tier": provenance_raw.get("mat_authority_tier"),
             "source": provenance_raw.get("mat_source"),
@@ -1051,35 +1252,51 @@ def _parse_single_component_block(block_text, global_mat=None, notices=None):
 
     return {
         "component_name": component_name,
+        "component_type": component_type,
         "explicit_minimum_required_mat": (
             {"value": mat_value, "unit": mat_unit} if mat_value is not None else None
         ),
         "mat_provenance": mat_provenance,
         "ut_provenance": ut_provenance,
+        "attached_reinforcement": attached,
+        "reading_sets": reading_sets,
+        "historical_sets": historical_sets,
         "ut_thickness_measurements": ut_readings,
         "historical_ut_thickness_measurements": historical_readings,
         "non_pressure_boundary_measurements": pad_readings,
     }
 
 
+_KEY_STRIP_WORDS = re.compile(r"\b(shell|tubes?|channel|flange|component|course)\b", re.IGNORECASE)
+
+
+def _component_key(name):
+    """Merge key for one PHYSICAL component. 'S3', 'Shell S3' and 's-3' all map
+    to 's3'; anything that isn't a short identifier keeps its full lowercase
+    name, so distinct components are never collapsed by accident."""
+    raw = (name or "").strip().lower()
+    stripped = re.sub(r"[^a-z0-9]", "", _KEY_STRIP_WORDS.sub("", raw))
+    if re.fullmatch(r"[a-z]{1,2}\d{1,3}", stripped):
+        return stripped
+    return raw
+
+
 def _merge_duplicate_components(components, notices):
     """Relational-linking safety net: merges component dicts that share the
-    same normalized component_name into a single entry, appending readings
-    rather than creating duplicate component IDs. This is the fix for the
-    ingestion failure mode where the same physical component (e.g. 'S3')
-    appears once in a current-cycle UT table and again in a separate
-    prior-year/historical table, and would otherwise become two component
-    entries instead of one entry with both current and historical readings.
-
-    Order of first appearance is preserved. When more than one merged block
-    states its own explicit MAT, the first non-null one is kept (a real
-    conflict here would already have been visible to the model as duplicate
-    per-component MAT lines — this function does not attempt to adjudicate
-    that, only to stop duplicate component IDs from being created)."""
+    same physical-component key into ONE entry (one master record per
+    component), appending readings/reading sets instead of creating duplicate
+    component IDs. Order of first appearance is preserved. When more than one
+    merged block states its own MAT, the first non-null one is kept; this
+    function does not adjudicate MAT conflicts (MAT binding is decided later,
+    by component_type, in audit_and_reconcile)."""
     merged_by_key = {}
     order = []
+    list_fields = (
+        "ut_thickness_measurements", "historical_ut_thickness_measurements",
+        "non_pressure_boundary_measurements", "reading_sets", "historical_sets",
+    )
     for comp in components:
-        key = (comp.get("component_name") or "").strip().lower()
+        key = _component_key(comp.get("component_name"))
         if not key:
             order.append(comp)
             continue
@@ -1088,9 +1305,12 @@ def _merge_duplicate_components(components, notices):
             order.append(comp)
             continue
         existing = merged_by_key[key]
-        existing["ut_thickness_measurements"] = (existing.get("ut_thickness_measurements") or []) + (comp.get("ut_thickness_measurements") or [])
-        existing["historical_ut_thickness_measurements"] = (existing.get("historical_ut_thickness_measurements") or []) + (comp.get("historical_ut_thickness_measurements") or [])
-        existing["non_pressure_boundary_measurements"] = (existing.get("non_pressure_boundary_measurements") or []) + (comp.get("non_pressure_boundary_measurements") or [])
+        for f in list_fields:
+            existing[f] = (existing.get(f) or []) + (comp.get(f) or [])
+        if not existing.get("component_type") and comp.get("component_type"):
+            existing["component_type"] = comp["component_type"]
+        if not existing.get("attached_reinforcement") and comp.get("attached_reinforcement"):
+            existing["attached_reinforcement"] = comp["attached_reinforcement"]
         if not existing.get("explicit_minimum_required_mat") and comp.get("explicit_minimum_required_mat"):
             existing["explicit_minimum_required_mat"] = comp["explicit_minimum_required_mat"]
             existing["mat_provenance"] = comp.get("mat_provenance")
@@ -1098,8 +1318,8 @@ def _merge_duplicate_components(components, notices):
             existing["ut_provenance"] = comp.get("ut_provenance")
         notices.append(
             f"Relational linking: merged a duplicate '{comp.get('component_name')}' block into the "
-            "existing component entry instead of creating a second component ID (likely the same "
-            "physical component appearing in both a current-cycle and a historical/prior-year table)."
+            "existing component entry instead of creating a second component ID (same physical "
+            "component appearing in more than one table/document)."
         )
     return order
 
@@ -1413,18 +1633,6 @@ def execute_fallback_reparse(raw_report, global_mat=None):
             mat_provenance = None
             if mat_values:
                 explicit_minimum_required_mat = {"value": mat_values[0]["value"], "unit": mat_values[0]["unit"]}
-            elif global_mat and global_mat.get("value") is not None:
-                explicit_minimum_required_mat = {"value": global_mat.get("value"), "unit": global_mat.get("unit")}
-                mat_provenance = {
-                    "authority_tier": None,
-                    "source": "Document-wide global MAT (propagated — no per-component minimum stated)",
-                    "general_criterion": None,
-                    "reason": "This component stated no minimum of its own; the document-wide global MAT was applied.",
-                }
-                notices.append(
-                    f"'{component_name}': no per-component MAT column value found — propagated the "
-                    f"document-wide global MAT ({global_mat.get('value')} {global_mat.get('unit') or ''}).".strip()
-                )
             else:
                 explicit_minimum_required_mat = None
 
@@ -1469,6 +1677,528 @@ def execute_fallback_reparse(raw_report, global_mat=None):
             "confidently recover any component rows from it."
         )
     return components, notices
+
+
+# ============================================================================
+# POST-EXTRACTION SEMANTIC AUDITOR — audit_and_reconcile
+# ----------------------------------------------------------------------------
+# Deterministic, plain-Python pass that runs AFTER parsing and BEFORE any
+# pass/fail margin is computed. In order, per component:
+#   1. resolve component_type (declared by the model, else inferred from name)
+#   2. normalize every reading to dual units (in + mm) and run the unit sanity
+#      check (a tube reading > 0.500 in is mm-misidentified -> auto-convert)
+#   3. apply document precedence (signed addendum / re-run supersedes the
+#      final report) and archive superseded readings
+#   4. link any repair pad as non-pressure-retaining reinforcement, never
+#      letting pad thickness govern a pressure calculation
+#   5. reconcile historical records by physical equivalence (<= 1% after unit
+#      conversion) so in/mm duplicates collapse into one lineage entry
+#   6. bind the governing MAT by component_type (tube MAT never = shell MAT)
+# evaluate() then recomputes every margin from these normalized values.
+# ============================================================================
+
+MM_PER_IN = 25.4
+TUBE_MAX_PLAUSIBLE_IN = 0.500     # any tube wall reading above this is suspect
+OTHER_MAX_PLAUSIBLE_IN = 4.000    # generic ceiling for non-tube components
+MIN_PLAUSIBLE_MM = 0.25           # an "mm" value below this is really inches
+EQUIVALENCE_TOLERANCE = 0.01      # <= 1% variance after unit conversion
+PAD_TOLERANCE_IN = 0.0005
+KNOWN_COMPONENT_TYPES = ("shell", "tube", "channel", "flange", "head", "nozzle", "support", "plate", "other")
+NO_GLOBAL_MAT_TYPES = ("tube",)   # the document-wide (shell) MAT never binds to these
+
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], start=1)}
+
+
+def _to_in_mm(value, unit):
+    if unit == "in":
+        return value, value * MM_PER_IN
+    if unit == "mm":
+        return value / MM_PER_IN, value
+    return None, None
+
+
+def _infer_component_type(name, declared=None):
+    """Returns (type, how). A type declared by the extraction wins; otherwise
+    it is inferred from the component name."""
+    d = (declared or "").strip().lower()
+    if d.endswith("s") and d[:-1] in KNOWN_COMPONENT_TYPES:
+        d = d[:-1]
+    if d in KNOWN_COMPONENT_TYPES:
+        return d, "declared"
+    n = (name or "").lower()
+    if re.search(r"\btubes?\b|\bcoil\b|\bbundle\b", n) or re.fullmatch(r"\s*t-?\d{1,3}\s*", n):
+        return "tube", "name"
+    for word in ("channel", "flange", "head", "nozzle"):
+        if word in n:
+            return word, "name"
+    if re.search(r"\bshell\b|\bcourse\b", n) or re.fullmatch(r"\s*s-?\d{1,3}\s*", n):
+        return "shell", "name"
+    return "other", "name"
+
+
+def _component_id(name):
+    m = re.search(r"\b([A-Za-z]{1,2})-?(\d{1,3})\b", name or "")
+    return f"{m.group(1).upper()}{m.group(2)}" if m else (name or "UNNAMED")
+
+
+def _parse_doc_date(text):
+    """Best-effort date -> sortable (year, month, day) tuple; None if unreadable.
+    A missing year sorts as 0 (only same-year ordering is assumed)."""
+    if not text:
+        return None
+    t = str(text).strip().lower()
+    m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", t)
+    if m:
+        return int(m.group(1)), int(m.group(2)), int(m.group(3))
+    m = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?", t)
+    if m:
+        return int(m.group(3) or 0), _MONTHS[m.group(1)], int(m.group(2))
+    m = re.fullmatch(r"\s*(\d{4})\s*", t)
+    if m:
+        return int(m.group(1)), 0, 0
+    return None
+
+
+def _date_key(s):
+    return _parse_doc_date(s.get("doc_date")) or (-1, -1, -1)
+
+
+def _doc_tier(s):
+    """2 = signed addendum or re-run (supersedes earlier readings);
+    1 = everything else (final report, worksheet, notes...)."""
+    text = f"{s.get('doc_type') or ''} {s.get('source') or ''}".lower()
+    signed_addendum = bool(s.get("is_signed_addendum")) or ("addendum" in text and "signed" in text)
+    rerun = bool(re.search(r"re-?run|re-?test|re-?inspect|re-?shoot|re-?measure", text))
+    return 2 if (signed_addendum or rerun) else 1
+
+
+def _doc_identity(s):
+    return ((s.get("doc_type") or "").lower(), (s.get("doc_date") or "").lower(), (s.get("source") or "").lower())
+
+
+def _source_label(s):
+    return s.get("source") or s.get("doc_type") or "Unnamed source"
+
+
+def _enrich_from_registry(s, registry):
+    src = (s.get("source") or "").strip().lower()
+    if len(src) < 4 or not registry:
+        return
+    for doc in registry:
+        name = (doc.get("document_name") or "").strip().lower()
+        if name and (name in src or src in name):
+            s["doc_type"] = s.get("doc_type") or doc.get("document_type")
+            s["doc_date"] = s.get("doc_date") or doc.get("document_date")
+            if doc.get("is_signed_addendum"):
+                s["is_signed_addendum"] = True
+            return
+
+
+def _ensure_sets(comp):
+    """Returns (reading_sets, historical_sets) as deep-ish copies. Components
+    that never went through the flat-manifest parser (e.g. fallback-reparsed
+    table rows) get their flat lists wrapped into a single default set."""
+    sets = [dict(s, readings=[dict(r) for r in s.get("readings") or []]) for s in comp.get("reading_sets") or []]
+    if not sets:
+        prov = comp.get("ut_provenance") or {}
+        cur = [dict(r) for r in comp.get("ut_thickness_measurements") or []]
+        pads = [dict(r, is_pad=True) for r in comp.get("non_pressure_boundary_measurements") or []]
+        if cur or pads:
+            sets.append({"doc_type": prov.get("authority_tier"), "doc_date": prov.get("source_date"),
+                         "is_signed_addendum": False, "source": prov.get("source"), "readings": cur + pads})
+    hsets = [dict(s, readings=[dict(r) for r in s.get("readings") or []]) for s in comp.get("historical_sets") or []]
+    if not hsets:
+        hist = [dict(r) for r in comp.get("historical_ut_thickness_measurements") or []]
+        if hist:
+            hsets.append({"doc_date": None, "source": None, "readings": hist})
+    return sets, hsets
+
+
+def _normalize_reading(r, comp_type):
+    """Normalizes one reading to dual units and runs the unit sanity check.
+    Mutates r. Returns (status, message) with status OK / CORRECTED / REVIEW.
+    A REVIEW reading is never given an inch value, so it cannot reach a margin."""
+    raw_value = r.get("value")
+    unit = _normalize_unit(r.get("unit"))
+    label = r.get("location_label")
+    r["value_raw"] = raw_value
+    r["unit_as_extracted"] = r.get("unit")
+    if raw_value is None or unit is None:
+        r["unit_status"] = "REVIEW"
+        return "REVIEW", (f"reading '{label}' = {raw_value} has no recognizable unit — excluded from margin "
+                          "calculations pending unit review.")
+    v_in, v_mm = _to_in_mm(raw_value, unit)
+    limit = TUBE_MAX_PLAUSIBLE_IN if comp_type == "tube" else OTHER_MAX_PLAUSIBLE_IN
+    status, message = "OK", None
+    if v_in > limit:
+        if comp_type == "tube" and unit == "in" and raw_value / MM_PER_IN <= limit:
+            unit = "mm"
+            v_in, v_mm = _to_in_mm(raw_value, "mm")
+            status = "CORRECTED"
+            message = (f"reading '{label}' = {raw_value:g} was tagged inches but exceeds the {limit:.3f} in "
+                       f"plausibility ceiling for a tube — reinterpreted as {raw_value:g} mm ({v_in:.5f} in).")
+        else:
+            r["unit_status"] = "REVIEW"
+            return "REVIEW", (f"reading '{label}' = {raw_value:g} {unit} ({v_in:.3f} in) exceeds the {limit:.3f} in "
+                              f"plausibility ceiling for a {comp_type} and could not be safely auto-corrected — "
+                              "excluded from margin calculations pending unit review.")
+    elif unit == "mm" and raw_value < MIN_PLAUSIBLE_MM:
+        r["unit_status"] = "REVIEW"
+        return "REVIEW", (f"reading '{label}' = {raw_value:g} mm is implausibly thin for a wall measurement "
+                          "(likely inches mislabeled as mm) — excluded pending unit review.")
+    r["value"] = round(v_in, 8)
+    r["unit"] = "in"
+    r["value_in"] = round(v_in, 8)
+    r["value_mm"] = round(v_mm, 4)
+    r["unit_stated"] = unit
+    r["unit_status"] = "CORRECTED_MM" if status == "CORRECTED" else "OK"
+    return status, message
+
+
+def _mat_to_in(value, unit, comp_type):
+    """Converts a MAT value to inches, with the same tube-unit sanity rule."""
+    u = _normalize_unit(unit)
+    if value is None or u is None:
+        return None, "MAT value has no recognizable unit"
+    v_in, _ = _to_in_mm(value, u)
+    if comp_type == "tube" and u == "in" and v_in > TUBE_MAX_PLAUSIBLE_IN and value / MM_PER_IN <= TUBE_MAX_PLAUSIBLE_IN:
+        return value / MM_PER_IN, f"MAT {value:g} 'in' exceeds the tube ceiling — reinterpreted as {value:g} mm"
+    return v_in, None
+
+
+def _apply_precedence(sets):
+    """Signed addendum / re-run supersedes earlier documents for this component.
+    Returns (active_sets, superseded_sets, info_notes, conflict_notes)."""
+    live = [s for s in sets if s.get("readings")]
+    info, conflicts = [], []
+    if not live:
+        return [], [], info, conflicts
+    for s in live:
+        s["tier"] = _doc_tier(s)
+    tier2 = [s for s in live if s["tier"] == 2]
+    if not tier2:
+        if len({_doc_identity(s) for s in live}) > 1:
+            info.append("current readings came from more than one document with no signed addendum or "
+                        "re-run — all retained; the lowest reading governs conservatively.")
+        return live, [], info, conflicts
+    best = max(_date_key(s) for s in tier2)
+    winners = [s for s in tier2 if _date_key(s) == best]
+    active, superseded = list(winners), []
+    for s in live:
+        if s in winners:
+            continue
+        if s["tier"] == 2 or _date_key(s) <= best:
+            superseded.append(s)
+        else:
+            active.append(s)
+            conflicts.append(f"'{_source_label(s)}' is dated after the signed addendum/re-run but is not itself "
+                             "a signed addendum or re-run — retained as active; confirm which governs.")
+    if superseded:
+        n = sum(len(s["readings"]) for s in superseded)
+        info.append(f"'{_source_label(winners[0])}' (signed addendum/re-run) supersedes {n} earlier reading(s) from "
+                    f"{', '.join(sorted({_source_label(s) for s in superseded}))}; archived in superseded_readings.")
+    return active, superseded, info, conflicts
+
+
+def _archive_record(r, s):
+    return {"location_label": r.get("location_label"), "value": r.get("value_raw"), "unit": r.get("unit_stated"),
+            "value_in": r.get("value_in"), "value_mm": r.get("value_mm"),
+            "source_document": _source_label(s), "document_date": s.get("doc_date"),
+            "document_type": s.get("doc_type")}
+
+
+def _labels_compatible(a, b):
+    na, nb = re.sub(r"[^a-z0-9]", "", (a or "").lower()), re.sub(r"[^a-z0-9]", "", (b or "").lower())
+    auto = lambda x: x == "" or re.fullmatch(r"r\d+", x) is not None
+    return na == nb or auto(na) or auto(nb)
+
+
+def _reconcile_history(entries):
+    """Collapses historical entries that are the SAME physical reading recorded
+    in different units/sources (<= 1% variance after conversion, same date,
+    compatible location label) into one lineage entry. Returns
+    (lineage, legacy_readings, notes)."""
+    def authority(e):
+        src = (e["source"] or "").lower()
+        return 1 if re.search(r"spreadsheet|worksheet|xls|csv", src) else 0
+    clusters, notes = [], []
+    for e in sorted(entries, key=authority):
+        placed = False
+        for c in clusters:
+            rep = c["members"][0]
+            same_date = (c["date"] or "") == (e["date"] or "")
+            close = abs(e["r"]["value_in"] - rep["r"]["value_in"]) / max(rep["r"]["value_in"], 1e-9) <= EQUIVALENCE_TOLERANCE
+            if same_date and close and _labels_compatible(e["r"].get("location_label"), rep["r"].get("location_label")):
+                c["members"].append(e)
+                placed = True
+                break
+        if not placed:
+            clusters.append({"date": e["date"], "members": [e]})
+    lineage, legacy = [], []
+    for c in clusters:
+        rep = c["members"][0]["r"]
+        item = {"date": c["date"], "location_label": rep.get("location_label"),
+                "reconciled_value_in": round(rep["value_in"], 5), "reconciled_value_mm": round(rep["value_mm"], 3),
+                "members": [{"value": m["r"].get("value_raw"), "unit": m["r"].get("unit_stated"),
+                             "value_in": m["r"]["value_in"], "value_mm": m["r"]["value_mm"], "source": m["source"]}
+                            for m in c["members"]]}
+        for m in c["members"]:
+            src = (m["source"] or "").lower()
+            kind = "spreadsheet" if re.search(r"spreadsheet|worksheet|xls|csv", src) else "report"
+            item.setdefault(f"source_{kind}_value", m["r"].get("value_raw"))
+            item.setdefault(f"source_{kind}_unit", m["r"].get("unit_stated"))
+        if len(c["members"]) > 1:
+            a, b = c["members"][0]["r"], c["members"][1]["r"]
+            pct = abs(a["value_in"] - b["value_in"]) / max(a["value_in"], 1e-9) * 100
+            item["note"] = (f"{a['value_raw']:g} {a['unit_stated']} and {b['value_raw']:g} {b['unit_stated']} are "
+                            f"equivalent within rounding tolerance ({pct:.2f}% variance after unit conversion).")
+        else:
+            item["note"] = "Single source record."
+        lineage.append(item)
+        legacy.append({"location_label": rep.get("location_label"), "value": rep["value_in"], "unit": "in",
+                       "value_in": rep["value_in"], "value_mm": rep["value_mm"]})
+    return lineage, legacy, notes
+
+
+def audit_and_reconcile(components, extracted):
+    """Deterministic post-extraction semantic auditor. Mutates each component
+    into its reconciled form and returns (components, notices). See the module
+    banner above for the ordered steps. Margins are NOT computed here — they
+    are recomputed by evaluate() only after this pass has finished."""
+    notices = []
+    registry = extracted.get("document_registry") or []
+    gm = extracted.get("global_minimum_allowable_thickness") or {}
+    g_in, g_note = _mat_to_in(gm.get("value"), gm.get("unit"), "shell") if gm.get("value") is not None else (None, None)
+    type_mat = {}
+    for row in extracted.get("component_mat_table") or []:
+        t = (row.get("component_type") or "").strip().lower()
+        if t.endswith("s") and t[:-1] in KNOWN_COMPONENT_TYPES:
+            t = t[:-1]
+        v_in, note = _mat_to_in(row.get("value"), row.get("unit"), t)
+        if t in KNOWN_COMPONENT_TYPES and v_in is not None:
+            type_mat[t] = {"value_in": v_in, "source": row.get("source")}
+            if note:
+                notices.append(f"MAT table ({t}): {note}.")
+
+    for comp in components:
+        name = comp.get("component_name") or "Unnamed Component"
+        ctype, how = _infer_component_type(name, comp.get("component_type"))
+        comp["component_type"] = ctype
+        comp["component_identifier"] = _component_id(name)
+        if how == "name":
+            notices.append(f"'{name}': component_type was not declared by the extraction — inferred '{ctype}' from the component name.")
+        review_notes, correction_notes, precedence_notes = [], [], []
+
+        sets, hsets = _ensure_sets(comp)
+        for s in sets + hsets:
+            _enrich_from_registry(s, registry)
+
+        # ---- 2. unit normalization + sanity (current readings) ----
+        for s in sets:
+            kept = []
+            for r in s["readings"]:
+                r["is_pad"] = bool(r.get("is_pad")) or _label_matches(r.get("location_label"), NON_BOUNDARY_LABEL_HINTS)
+                status, msg = _normalize_reading(r, ctype)
+                if status == "REVIEW":
+                    review_notes.append(msg)
+                    comp.setdefault("unit_review_readings", []).append(
+                        {"location_label": r.get("location_label"), "value": r.get("value_raw"),
+                         "unit": r.get("unit_as_extracted"), "source_document": _source_label(s)})
+                    continue
+                if status == "CORRECTED":
+                    correction_notes.append(msg)
+                kept.append(r)
+            s["readings"] = kept
+
+        # ---- 3. precedence / supersession ----
+        active_sets, superseded_sets, info, conflicts = _apply_precedence(sets)
+        precedence_notes += info
+        review_notes += conflicts
+        for s in active_sets:
+            for r in s["readings"]:
+                r.update({"source_document": _source_label(s), "document_date": s.get("doc_date"),
+                          "document_type": s.get("doc_type"), "is_signed_addendum": s.get("tier") == 2})
+        active_readings = [r for s in active_sets for r in s["readings"]]
+        superseded_records = [_archive_record(r, s) for s in superseded_sets for r in s["readings"]]
+
+        # ---- 4. repair-pad linkage ----
+        base = [r for r in active_readings if not r["is_pad"]]
+        pads = [r for r in active_readings if r["is_pad"]]
+        att = comp.get("attached_reinforcement")
+        pad_in = None
+        if att and att.get("pad_thickness") is not None:
+            pu = _normalize_unit(att.get("unit"))
+            pad_in = _to_in_mm(att["pad_thickness"], pu)[0] if pu else None
+            if att.get("is_pressure_retaining"):
+                review_notes.append("extraction marked the attached pad as pressure-retaining — overridden: a "
+                                    "non-replacement reinforcement pad is never credited as pressure-retaining.")
+        elif pads:
+            pad_in = min(r["value_in"] for r in pads)
+        if pad_in is not None:
+            leaked = [r for r in base if abs(r["value_in"] - pad_in) <= PAD_TOLERANCE_IN]
+            if leaked:
+                base = [r for r in base if r not in leaked]
+                pads += leaked
+                review_notes.append(f"{len(leaked)} base-shell reading(s) matched the reinforcement-pad thickness "
+                                    f"({pad_in:.4f} in) and were moved out of the pressure calculation.")
+            comp["attached_reinforcement"] = {
+                "pad_thickness": round(pad_in, 5), "pad_thickness_mm": round(pad_in * MM_PER_IN, 3),
+                "unit": "in", "is_pressure_retaining": False,
+                "note": "Non-replacement reinforcement: pressure calculations use the base pressure-retaining shell only.",
+            }
+        else:
+            comp["attached_reinforcement"] = None
+
+        # ---- 5. historical reconciliation ----
+        entries = []
+        for hs in hsets:
+            for r in hs["readings"]:
+                status, msg = _normalize_reading(r, ctype)
+                if status == "REVIEW":
+                    review_notes.append(f"historical {msg}")
+                    continue
+                if status == "CORRECTED":
+                    correction_notes.append(f"historical {msg}")
+                entries.append({"date": hs.get("doc_date"), "source": hs.get("source"), "r": r})
+        lineage, hist_legacy, _ = _reconcile_history(entries)
+
+        # ---- 6. MAT binding by component_type ----
+        own = comp.get("explicit_minimum_required_mat")
+        mat_in, binding = None, None
+        if own and own.get("value") is not None:
+            own_in, note = _mat_to_in(own["value"], own.get("unit"), ctype)
+            if note:
+                correction_notes.append(note)
+            if (ctype == "tube" and own_in is not None and g_in and ctype in type_mat
+                    and abs(own_in - g_in) / g_in <= EQUIVALENCE_TOLERANCE
+                    and abs(type_mat[ctype]["value_in"] - g_in) / g_in > EQUIVALENCE_TOLERANCE):
+                mat_in = type_mat[ctype]["value_in"]
+                binding = {"source": "component-type MAT table (overrode a value equal to the shell MAT)",
+                           "detail": type_mat[ctype].get("source")}
+                review_notes.append(f"stated MAT ({own_in:.4f} in) equals the shell MAT — replaced with the tube MAT "
+                                    f"({mat_in:.4f} in).")
+            elif own_in is not None:
+                mat_in, binding = own_in, {"source": "component-specific MAT", "detail": (comp.get("mat_provenance") or {}).get("source")}
+        if mat_in is None and ctype in type_mat:
+            mat_in = type_mat[ctype]["value_in"]
+            binding = {"source": f"{ctype} MAT from component-type table", "detail": type_mat[ctype].get("source")}
+        if mat_in is None and g_in is not None and ctype not in NO_GLOBAL_MAT_TYPES:
+            mat_in = g_in
+            binding = {"source": "document-wide MAT (shell-class default)", "detail": None}
+        if mat_in is None and ctype in NO_GLOBAL_MAT_TYPES and g_in is not None:
+            notices.append(f"'{name}': no tube-specific MAT was found — the document-wide shell MAT ({g_in:.4f} in) "
+                           "was deliberately NOT applied to this tube.")
+        if binding is not None:
+            binding["component_type"] = ctype
+            binding["value_in"] = round(mat_in, 5)
+        else:
+            binding = {"source": "none bound", "component_type": ctype, "value_in": None, "detail": None}
+        comp["explicit_minimum_required_mat"] = {"value": round(mat_in, 5), "unit": "in"} if mat_in is not None else None
+        comp["mat_binding"] = binding
+        if binding["source"] != "component-specific MAT" and mat_in is not None:
+            comp["mat_provenance"] = {"authority_tier": None, "source": binding["source"],
+                                      "general_criterion": None,
+                                      "reason": f"MAT bound by component_type='{ctype}' (never a shell MAT on a tube)."}
+
+        # ---- write reconciled data back ----
+        comp["ut_thickness_measurements"] = base
+        comp["non_pressure_boundary_measurements"] = pads
+        comp["historical_ut_thickness_measurements"] = hist_legacy
+        comp["superseded_readings"] = superseded_records
+        comp["historical_lineage"] = lineage
+        comp["review_notes"] = review_notes
+        comp["correction_notes"] = correction_notes
+        comp["precedence_notes"] = precedence_notes
+        comp["governing_document"] = (
+            {"source_document": _source_label(active_sets[0]), "document_date": active_sets[0].get("doc_date"),
+             "document_type": active_sets[0].get("doc_type"), "tier": active_sets[0].get("tier")}
+            if active_sets else None)
+        for msg in review_notes + correction_notes + precedence_notes:
+            notices.append(f"'{name}': {msg}")
+    return components, notices
+
+
+def build_master_records(components, results):
+    """One consolidated master record per physical component: identity, type,
+    bound MAT, active governing reading, superseded lineage, historical
+    lineage, and the verified calculation (taken from evaluate(), i.e. computed
+    only after reconciliation)."""
+    records = []
+    for comp, res in zip(components, results):
+        lowest = res.get("lowest")
+        active = comp.get("ut_thickness_measurements") or []
+        gdoc = comp.get("governing_document") or {}
+        summary = res.get("evaluation_summary") or {}
+        workflow = summary.get("workflow_status")
+        corrected = bool(comp.get("correction_notes"))
+        if res["status"] in ("blocked",):
+            pass_fail, validity = "FAIL", "FAILED_BELOW_MAT"
+        elif workflow == "CLEARED":
+            pass_fail, validity = "PASS", ("VERIFIED_WITH_UNIT_CORRECTION" if corrected else "VERIFIED_SECURE")
+        elif comp.get("unit_review_readings") and not active:
+            pass_fail, validity = "REVIEW", "UNIT_REVIEW_REQUIRED"
+        elif res["status"] in ("insufficient", "no_measurements", "no_criteria_no_measurements"):
+            pass_fail, validity = "INSUFFICIENT_DATA", "INSUFFICIENT_DATA"
+        else:
+            pass_fail, validity = "REVIEW", "REQUIRES_REVIEW"
+
+        active_reading = None
+        if active:
+            active_reading = {
+                "raw_values": [r.get("value_raw") for r in active],
+                "selected_governing_value_mm": lowest.get("value_mm") if lowest else None,
+                "selected_governing_value_in": round(lowest["value_in"], 5) if lowest else None,
+                "unit": lowest.get("unit_stated") if lowest else None,
+                "source_document": gdoc.get("source_document"),
+                "document_date": gdoc.get("document_date"),
+                "document_type": gdoc.get("document_type"),
+                "is_signed_addendum": gdoc.get("tier") == 2,
+                "is_superseding": bool(comp.get("superseded_readings")) and gdoc.get("tier") == 2,
+            }
+        mat = res.get("mat")
+        margin = res.get("margin")
+        records.append({
+            "component_identifier": comp.get("component_identifier") or comp.get("component_name"),
+            "component_name": comp.get("component_name"),
+            "component_type": comp.get("component_type"),
+            "governing_mat": {"value": round(mat, 5), "unit": "in"} if mat is not None else None,
+            "mat_binding": comp.get("mat_binding"),
+            "active_governing_reading": active_reading,
+            "attached_reinforcement": comp.get("attached_reinforcement"),
+            "superseded_readings": comp.get("superseded_readings") or [],
+            "historical_lineage": comp.get("historical_lineage") or [],
+            "unit_review_readings": comp.get("unit_review_readings") or [],
+            "engineering_calculations": {
+                "lowest_active_reading_in": round(lowest["value_in"], 5) if lowest else None,
+                "governing_mat_in": round(mat, 5) if mat is not None else None,
+                "true_margin_in": round(margin, 5) if margin is not None else None,
+                "pass_fail_status": pass_fail,
+                "calculation_validity": validity,
+            },
+        })
+    return records
+
+
+def _fmt_reading(r):
+    """'label: 0.3772 in (9.58 mm)' — dual-unit display of one reading."""
+    u = r.get("unit") or ""
+    s = f"{r.get('location_label')}: {r['value']:.4f} {u}".rstrip()
+    if u == "in" and r.get("value_mm") is not None:
+        s += f" ({r['value_mm']:.2f} mm)"
+    return s
+
+
+def render_master_records(records):
+    st.markdown("#### Consolidated Component Master Records")
+    st.caption("One master record per physical component: bound MAT, active governing reading, superseded "
+               "readings, historical lineage, and the calculation recomputed after unit normalization.")
+    for rec in records:
+        calc = rec["engineering_calculations"]
+        with st.expander(f"{rec['component_identifier']} ({rec['component_type']}) — {calc['pass_fail_status']} · {calc['calculation_validity']}"):
+            st.json(rec)
+    st.download_button("Download master records (JSON)", json.dumps(records, indent=2, default=str),
+                       file_name="component_master_records.json", mime="application/json")
 
 
 # ============================================================================
@@ -1641,6 +2371,16 @@ def evaluate_component(component, is_piping, piping_vars):
     mat_provenance = component.get("mat_provenance")
     ut_provenance = component.get("ut_provenance")
 
+    if not ut_list and component.get("unit_review_readings"):
+        missing = ["Verified unit for reading(s): " + ", ".join(
+            f"{r.get('location_label')}={r.get('value')} {r.get('unit') or '(no unit)'}"
+            for r in component["unit_review_readings"])]
+        evaluation_summary = build_evaluation_summary("insufficient", name)
+        return {"name": name, "status": "insufficient", "missing_vars": missing,
+                 "ut_measurements": [], "mat_provenance": mat_provenance,
+                 "ut_provenance": ut_provenance, "degradation": degradation,
+                 "evaluation_summary": evaluation_summary, "raw": component}
+
     if not ut_list:
         # Distinguish "we have a stated minimum but nothing to test it against"
         # from "we have neither criteria nor measurements at all" — the two
@@ -1698,7 +2438,7 @@ def evaluate_component(component, is_piping, piping_vars):
                      "evaluation_summary": evaluation_summary, "raw": component}
 
     lowest = min(ut_list, key=lambda r: r["value"])
-    margin = round(lowest["value"] - mat, 4)
+    margin = round(lowest["value"] - mat, 5)  # values are normalized inches at this point
     status = "blocked" if margin < 0 else "verified"
     pad_flag = status == "blocked" and bool(non_boundary_readings)
     evaluation_summary = build_evaluation_summary(status, name, lowest=lowest, mat=mat, mat_unit=mat_unit,
@@ -1908,6 +2648,12 @@ def evaluate(extracted):
     pressure_excursions = evaluate_pressure_events(extracted.get("pressure_events"))
 
     risk_ledger = build_risk_ledger(results, field_anomalies, pressure_excursions, ledger_items)
+    for c in components:
+        nm = c.get("component_name") or "Unnamed Component"
+        for msg in c.get("review_notes") or []:
+            risk_ledger["REQUIRES_VERIFICATION"].append(f"{nm}: {msg}")
+        for msg in (c.get("correction_notes") or []) + (c.get("precedence_notes") or []):
+            risk_ledger["INFORMATIONAL"].append(f"{nm}: {msg}")
     has_fail = bool(risk_ledger["FAIL_BELOW_CRITERION"])
     has_other_open_risk = any(risk_ledger[t] for t in ("CONFLICT", "MISSING_INFORMATION", "REQUIRES_VERIFICATION"))
 
@@ -1938,7 +2684,8 @@ def evaluate(extracted):
              "field_anomalies": field_anomalies, "degradations": degradations,
              "pressure_excursions": pressure_excursions, "risk_ledger": risk_ledger,
              "global_status": global_status, "ledger_message": ledger_message,
-             "confidence_metrics": confidence_metrics}
+             "confidence_metrics": confidence_metrics,
+             "master_records": build_master_records(components, results)}
 
 
 def build_status_ledger_message(global_status, risk_ledger):
@@ -2242,6 +2989,13 @@ def render_audit_trail_expander(result, next_steps):
         st.markdown(f"7. **Action Items** — {steps_text}")
 
 
+def _mat_binding_text(result):
+    mb = (result.get("raw") or {}).get("mat_binding") or {}
+    if not mb:
+        return "n/a"
+    return f"{mb.get('component_type', '?')} → {mb.get('source', 'n/a')}"
+
+
 def render_component_card(result, extracted):
     status = result["status"]
     via_fallback = bool(result.get("via_fallback"))
@@ -2330,8 +3084,9 @@ def render_component_card(result, extracted):
         # Required Minimum MAT -> Computed True Margin -> Status, in one row.
         st.markdown(
             "<table class='calc-trail-table'>"
-            f"<tr><td class='label'>Measured Minimum UT</td><td>{lowest['location_label']}: {lowest['value']:.4f}{lowest_unit}</td></tr>"
+            f"<tr><td class='label'>Measured Minimum UT</td><td>{_fmt_reading(lowest)}</td></tr>"
             f"<tr><td class='label'>Required Minimum MAT</td><td>{result['mat']:.4f}{unit_suffix}</td></tr>"
+            f"<tr><td class='label'>MAT Binding</td><td>{_mat_binding_text(result)}</td></tr>"
             f"<tr><td class='label'>Computed True Margin</td><td>{result['margin']:+.4f}</td></tr>"
             f"<tr><td class='label'>Status</td><td>{pill_label}</td></tr>"
             "</table>",
@@ -2428,6 +3183,12 @@ if uploaded is not None:
                     components_matrix = fallback_components
                     parse_notices = list(parse_notices) + fallback_notices
 
+                # Deterministic semantic audit: unit sanity, addendum precedence, pad linkage,
+                # historical reconciliation and MAT-by-component-type binding. Margins are only
+                # computed afterwards (evaluate), from the normalized values.
+                components_matrix, recon_notices = audit_and_reconcile(components_matrix, extracted)
+                parse_notices = list(parse_notices) + recon_notices
+
                 extracted["components_matrix"] = components_matrix
                 st.session_state["extracted"] = extracted
                 st.session_state["parse_notices"] = parse_notices
@@ -2497,13 +3258,15 @@ if uploaded is not None:
         if gmat.get("value") is not None:
             st.caption(
                 f"📐 Document-wide global MAT on file: {gmat['value']:g} {gmat.get('unit') or ''} — "
-                "propagated into any component below that states no minimum of its own."
+                "applied to shell-class components only, never to tubes."
             )
 
         st.markdown("#### Calculation Trail Ledger")
         st.caption("Component Name → Measured Minimum UT → Required Minimum MAT → Computed True Margin → Calculation Result / Workflow Status → Potential Next Steps")
         for result in outcome["results"]:
             render_component_card(result, extracted)
+
+        render_master_records(outcome["master_records"])
 
         ledger = extracted.get("missing_engineering_variables_ledger") or []
         if ledger:
