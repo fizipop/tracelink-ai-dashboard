@@ -81,6 +81,21 @@ REFACTOR (units / component types / precedence / master records):
   * build_master_records() emits ONE consolidated record per physical
     component (S1..S6, T1..T4) with its full lineage and verified calculation.
 
+REFACTOR (completeness / location-level precedence / liability terminology):
+  * EXTRACTION COMPLETENESS: every location reading (S01..S08, N2-C, T1..) must be
+    extracted into its parent component. compute_extraction_reconciliation() matches every
+    decimal token found on a location line of the RAW text against the readings actually
+    mapped into components. < 95% mapped globally (or any unmapped reading attributable to a
+    component) forces the global state "REQUIRES VERIFICATION — INCOMPLETE EXTRACTION" and
+    withholds pass/fail margin calculations until the user manually confirms.
+  * LOCATION-LEVEL PRECEDENCE: a signed addendum / re-run supersedes ONLY the individual
+    locations it re-measured (label-to-label match). All other final-report readings stay
+    active, and the true minimum is selected across all active locations.
+  * PROVENANCE: every component carries a location_readings_matrix and a "why NOT chosen"
+    trail for every evaluated reading.
+  * TERMINOLOGY: "VERIFIED SECURE" -> "DATA WORKFLOW VERIFIED", "CLEARED" -> "READINGS
+    PROCESS COMPLETE", plus a mandatory legal/disclaimer banner.
+
 Model note: MODEL_NAME stays "claude-opus-5-5" per your standing
 instruction.
 
@@ -108,6 +123,7 @@ except ImportError:
 import os
 import re
 import json
+from collections import Counter
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -353,6 +369,19 @@ st.markdown(
     /* Decoupled math-vs-workflow status line inside a component card */
     .decoupled-status-line { font-size: 0.8rem; color: #9CA3AF; margin: 4px 0 8px 0; }
     .decoupled-status-line b { color: #E5E7EB; }
+
+    /* Mandatory legal / liability disclaimer banner */
+    .legal-banner {
+        background: rgba(120, 95, 15, 0.22);
+        border: 1px solid #FBBF24;
+        border-radius: 14px;
+        color: #FEF3C7;
+        font-size: 0.85rem;
+        line-height: 1.45;
+        padding: 12px 18px;
+        margin: 6px 0 16px 0;
+    }
+    .legal-banner b { color: #FDE68A; }
     </style>
 
     <div><div class="glass-title-container">
@@ -464,6 +493,24 @@ UNIT / TYPE / PAD RULES THAT DRIVE DOWNSTREAM SAFETY LOGIC:
   * A repair pad's thickness goes only on Attached_Reinforcement, never on the
     base-shell reading lines.
 
+LOCATION-LEVEL COMPLETENESS RULES (HARD REQUIREMENT — a Python audit reconciles EVERY decimal
+number printed on a location line of the report against what you emit; any omitted reading forces
+the whole run to be withheld as INCOMPLETE EXTRACTION):
+  * EVERY individual location reading (S01, S02, S03, ... S08, N1, N2-A, T1..T40 — whatever the
+    report labels) MUST appear as its OWN <label>=<value> <unit> entry on the Reading_Set: / UT: /
+    Historical_Set: line of its parent component. Never summarize, sample, keep only "the lowest
+    few", skip a row because it looks unremarkable, or collapse a range into its minimum. A
+    shell with 8 listed locations has 8 entries — not 1, not 4.
+  * Use the report's OWN location identifier as the label (e.g. "S03", "N2-C"); never rename it.
+  * Every reading in a table row belongs to the component that row/table belongs to. Each row
+    keeps the unit printed on that row (a mixed mm / in table stays mixed).
+  * A signed addendum / re-run Reading_Set contains ONLY the locations that addendum itself
+    re-measured (e.g. S04, N2-C, N3-C). Never copy the earlier final report's other locations into
+    the addendum Reading_Set, and never drop them from the final report's Reading_Set — Python
+    applies supersession per LOCATION, matching label to label.
+  * Before finishing, re-count: for each component the number of entries you emitted must equal the
+    number of location readings printed for that component in the report.
+
 SOURCE PRECEDENCE TIERS (highest authority first — use these exact strings
 for any _Authority_Tier line, and never let a lower tier silently overwrite
 a higher one; see the CONFLICT rule below instead):
@@ -489,6 +536,11 @@ Read the raw inspection text the user provides and call the \
   omitted line, per the manifest format below) for anything not stated, and \
   list it in missing_engineering_variables_ledger if it is needed for a \
   downstream calculation.
+
+- COMPLETENESS (hard requirement): extract EVERY single location identifier and its value into \
+  its parent component without skipping, sampling, or summarizing. Follow the LOCATION-LEVEL \
+  COMPLETENESS RULES in the grammar below exactly. Addenda list only the locations they \
+  re-measured.
 
 - "flat_manifest_block" is a single string holding every component's data as \
   plain marked-up text — NOT JSON, NOT a nested array. Follow this exact \
@@ -767,7 +819,7 @@ EXTRACTION_TOOL = {
                         "document_type": {"type": "string"},
                         "document_date": {"type": ["string", "null"], "description": "ISO YYYY-MM-DD if possible."},
                         "is_signed_addendum": {"type": "boolean"},
-                        "supersedes": {"type": "array", "items": {"type": "string"}, "description": "Component identifiers the document says it supersedes, e.g. S3, S5, T3."},
+                        "supersedes": {"type": "array", "items": {"type": "string"}, "description": "LOCATION identifiers (not whole components) the document says it supersedes, e.g. S04, N2-C, N3-C. Never list locations the document did not itself re-measure."},
                     },
                     "required": ["document_name", "document_type", "is_signed_addendum"],
                 },
@@ -836,7 +888,7 @@ def _request_structured_extraction(client, report_text, system_prompt):
         # single flat string field can legitimately need more room on a
         # dense report than several small nested objects did, since there's
         # no per-object JSON scaffolding splitting up the budget anymore.
-        max_tokens=8000,  # raised: Reading_Set / Historical_Set lines make the manifest longer
+        max_tokens=12000,  # raised again: full location-by-location transcription of dense reports
         system=system_prompt,
         tools=[EXTRACTION_TOOL],
         tool_choice={"type": "auto"},
@@ -1512,6 +1564,7 @@ def _fallback_numbers_from(col_indices, cells, header_cells, default_unit=None, 
                 continue
             conversion_note = None
             unit = None
+            source_token_value = val  # the number exactly as printed, before any conversion
             label = base_label if len(tokens) == 1 else f"{base_label}_{j + 1}"
             if is_inches:
                 converted = round(val * 25.4, 4)
@@ -1533,7 +1586,8 @@ def _fallback_numbers_from(col_indices, cells, header_cells, default_unit=None, 
                     "document-wide default unit is available — flagged as unusable pending verification "
                     "rather than treated as a valid measurement."
                 )
-            out.append({"location_label": label, "value": val, "unit": unit, "conversion_note": conversion_note})
+            out.append({"location_label": label, "value": val, "unit": unit, "conversion_note": conversion_note,
+                        "source_token_value": source_token_value})
     return out
 
 
@@ -1549,7 +1603,7 @@ def execute_fallback_reparse(raw_report, global_mat=None):
     extraction: every component it returns is tagged fallback_extracted=True,
     which downstream evaluation treats conservatively (a failing margin
     still BLOCKS; a passing margin is routed to NEEDS_HUMAN_REVIEW rather
-    than confidently CLEARED — see build_evaluation_summary's via_fallback
+    than confidently READINGS PROCESS COMPLETE — see build_evaluation_summary's via_fallback
     handling) rather than as a definitive pass/fail.
 
     Returns (components: list[dict], notices: list[str])."""
@@ -1867,9 +1921,48 @@ def _mat_to_in(value, unit, comp_type):
     return v_in, None
 
 
+def _location_key(label):
+    """Normalized physical-location identifier used for supersession matching.
+    'S03', 'S3' and 's-03' all map to 's3'; 'N2-C' maps to 'n2c'. Nothing is ever
+    fuzzy-matched beyond this: S3 and S3-A are DIFFERENT locations, so an addendum for
+    'S3-A' never silently supersedes 'S3' (both stay active, the lowest governs)."""
+    t = re.sub(r"[^a-z0-9]", "", (label or "").lower())
+    return re.sub(r"(?<![0-9])0+(?=[0-9])", "", t)
+
+
+def _is_auto_location(key):
+    """Auto-generated labels (R1, R2, ...) or blank labels carry no physical location, so they
+    can never be matched for supersession."""
+    return key == "" or re.fullmatch(r"r\d+", key) is not None
+
+
+def _natural_key(label):
+    return [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", (label or "").lower())]
+
+
+def _reading_summary(r, s):
+    return {"location_label": r.get("location_label"), "value": r.get("value_raw"),
+            "unit": r.get("unit_stated"), "value_in": r.get("value_in"), "value_mm": r.get("value_mm"),
+            "source": _source_label(s), "document_date": s.get("doc_date")}
+
+
+def _ledger_entry(r, kind, s, status):
+    raw = r.get("source_token_value")
+    if raw is None:
+        raw = r.get("value_raw")
+    return {"location_label": r.get("location_label"), "raw_value": raw, "unit": r.get("unit_as_extracted"),
+            "kind": kind, "source": _source_label(s), "unit_status": status}
+
+
 def _apply_precedence(sets):
-    """Signed addendum / re-run supersedes earlier documents for this component.
-    Returns (active_sets, superseded_sets, info_notes, conflict_notes)."""
+    """LOCATION-LEVEL supersession. A signed addendum / re-run supersedes ONLY the individual
+    locations it re-measured (label-to-label match), never the whole earlier document.
+    Locations the addendum does not mention stay active from the earlier report, and the
+    governing minimum is later chosen across ALL active locations.
+
+    Returns (active_sets, superseded_sets, info_notes, conflict_notes). Sets are rebuilt copies
+    whose 'readings' hold only the active / only the superseded readings respectively; each
+    superseded reading carries 'superseded_by' (the winning addendum reading(s))."""
     live = [s for s in sets if s.get("readings")]
     info, conflicts = [], []
     if not live:
@@ -1882,30 +1975,75 @@ def _apply_precedence(sets):
             info.append("current readings came from more than one document with no signed addendum or "
                         "re-run — all retained; the lowest reading governs conservatively.")
         return live, [], info, conflicts
-    best = max(_date_key(s) for s in tier2)
-    winners = [s for s in tier2 if _date_key(s) == best]
-    active, superseded = list(winners), []
+
+    # location key -> the most recent addendum reading(s) for that exact location
+    winners = {}
+    for s in tier2:
+        dk = _date_key(s)
+        for r in s["readings"]:
+            k = _location_key(r.get("location_label"))
+            if _is_auto_location(k):
+                continue
+            cur = winners.get(k)
+            if cur is None or dk > cur["date"]:
+                winners[k] = {"date": dk, "items": [(s, r)]}
+            elif dk == cur["date"]:
+                cur["items"].append((s, r))
+    winner_ids = {id(r) for w in winners.values() for _, r in w["items"]}
+
+    active_by_set = {id(s): [] for s in live}
+    superseded_by_set = {id(s): [] for s in live}
+    superseded_locs = {}
     for s in live:
-        if s in winners:
-            continue
-        if s["tier"] == 2 or _date_key(s) <= best:
-            superseded.append(s)
-        else:
-            active.append(s)
-            conflicts.append(f"'{_source_label(s)}' is dated after the signed addendum/re-run but is not itself "
-                             "a signed addendum or re-run — retained as active; confirm which governs.")
-    if superseded:
-        n = sum(len(s["readings"]) for s in superseded)
-        info.append(f"'{_source_label(winners[0])}' (signed addendum/re-run) supersedes {n} earlier reading(s) from "
-                    f"{', '.join(sorted({_source_label(s) for s in superseded}))}; archived in superseded_readings.")
-    return active, superseded, info, conflicts
+        for r in s["readings"]:
+            k = _location_key(r.get("location_label"))
+            w = None if _is_auto_location(k) else winners.get(k)
+            if w is None or id(r) in winner_ids:
+                active_by_set[id(s)].append(r)  # location never re-measured -> stays current
+                continue
+            if s["tier"] == 1 and _date_key(s) > w["date"]:
+                active_by_set[id(s)].append(r)
+                conflicts.append(f"'{_source_label(s)}' location {r.get('location_label')} is dated after the "
+                                 "signed addendum/re-run for that location but is not itself a signed addendum "
+                                 "or re-run — retained as active; confirm which governs.")
+                continue
+            r["superseded_by"] = [_reading_summary(wr, ws) for ws, wr in w["items"]]
+            r["superseded_location_key"] = k
+            superseded_by_set[id(s)].append(r)
+            for ws, wr in w["items"]:
+                superseded_locs.setdefault(_source_label(ws), set()).add(wr.get("location_label"))
+
+    for src_label, locs in superseded_locs.items():
+        info.append(f"{src_label} supersedes prior readings ONLY for location(s) "
+                    f"{', '.join(sorted(locs, key=_natural_key))}. All other earlier-report readings for this "
+                    "component remain current.")
+    for s in tier2:
+        other_keys = {_location_key(r.get("location_label")) for o in live if o is not s for r in o["readings"]}
+        new_only = [r.get("location_label") for r in s["readings"]
+                    if not _is_auto_location(_location_key(r.get("location_label")))
+                    and _location_key(r.get("location_label")) not in other_keys]
+        no_id = [r.get("location_label") for r in s["readings"] if _is_auto_location(_location_key(r.get("location_label")))]
+        if new_only:
+            info.append(f"{_source_label(s)}: location(s) {', '.join(sorted(new_only, key=_natural_key))} have no "
+                        "identical earlier location on file — kept as additional active readings (nothing superseded).")
+        if no_id:
+            info.append(f"{_source_label(s)}: {len(no_id)} reading(s) carry no location identifier, so they cannot be "
+                        "matched to a prior location — nothing was superseded for them; all are retained as active.")
+
+    active_sets = [dict(s, readings=active_by_set[id(s)]) for s in live if active_by_set[id(s)]]
+    superseded_sets = [dict(s, readings=superseded_by_set[id(s)]) for s in live if superseded_by_set[id(s)]]
+    active_sets.sort(key=lambda s: (s["tier"], _date_key(s)), reverse=True)
+    return active_sets, superseded_sets, info, conflicts
 
 
 def _archive_record(r, s):
     return {"location_label": r.get("location_label"), "value": r.get("value_raw"), "unit": r.get("unit_stated"),
             "value_in": r.get("value_in"), "value_mm": r.get("value_mm"),
             "source_document": _source_label(s), "document_date": s.get("doc_date"),
-            "document_type": s.get("doc_type")}
+            "document_type": s.get("doc_type"),
+            "status": "SUPERSEDED_BY_ADDENDUM",
+            "supersession_scope": "this location only",
+            "superseded_by": r.get("superseded_by") or []}
 
 
 def _labels_compatible(a, b):
@@ -1989,6 +2127,7 @@ def audit_and_reconcile(components, extracted):
         if how == "name":
             notices.append(f"'{name}': component_type was not declared by the extraction — inferred '{ctype}' from the component name.")
         review_notes, correction_notes, precedence_notes = [], [], []
+        ledger = []  # every raw reading exactly as extracted, BEFORE precedence/dedupe (completeness audit)
 
         sets, hsets = _ensure_sets(comp)
         for s in sets + hsets:
@@ -2000,6 +2139,7 @@ def audit_and_reconcile(components, extracted):
             for r in s["readings"]:
                 r["is_pad"] = bool(r.get("is_pad")) or _label_matches(r.get("location_label"), NON_BOUNDARY_LABEL_HINTS)
                 status, msg = _normalize_reading(r, ctype)
+                ledger.append(_ledger_entry(r, "current", s, status))
                 if status == "REVIEW":
                     review_notes.append(msg)
                     comp.setdefault("unit_review_readings", []).append(
@@ -2026,6 +2166,7 @@ def audit_and_reconcile(components, extracted):
         base = [r for r in active_readings if not r["is_pad"]]
         pads = [r for r in active_readings if r["is_pad"]]
         att = comp.get("attached_reinforcement")
+        raw_extra_tokens = [att["pad_thickness"]] if att and att.get("pad_thickness") is not None else []
         pad_in = None
         if att and att.get("pad_thickness") is not None:
             pu = _normalize_unit(att.get("unit"))
@@ -2055,6 +2196,7 @@ def audit_and_reconcile(components, extracted):
         for hs in hsets:
             for r in hs["readings"]:
                 status, msg = _normalize_reading(r, ctype)
+                ledger.append(_ledger_entry(r, "historical", hs, status))
                 if status == "REVIEW":
                     review_notes.append(f"historical {msg}")
                     continue
@@ -2065,6 +2207,11 @@ def audit_and_reconcile(components, extracted):
 
         # ---- 6. MAT binding by component_type ----
         own = comp.get("explicit_minimum_required_mat")
+        if own and own.get("value") is not None:
+            raw_extra_tokens.append(own["value"])
+        gc_raw = (comp.get("mat_provenance") or {}).get("general_criterion")
+        if gc_raw is not None:
+            raw_extra_tokens.append(gc_raw)
         mat_in, binding = None, None
         if own and own.get("value") is not None:
             own_in, note = _mat_to_in(own["value"], own.get("unit"), ctype)
@@ -2106,6 +2253,8 @@ def audit_and_reconcile(components, extracted):
         comp["non_pressure_boundary_measurements"] = pads
         comp["historical_ut_thickness_measurements"] = hist_legacy
         comp["superseded_readings"] = superseded_records
+        comp["extraction_ledger"] = ledger
+        comp["extra_raw_tokens"] = raw_extra_tokens
         comp["historical_lineage"] = lineage
         comp["review_notes"] = review_notes
         comp["correction_notes"] = correction_notes
@@ -2119,29 +2268,121 @@ def audit_and_reconcile(components, extracted):
     return components, notices
 
 
-def build_master_records(components, results):
-    """One consolidated master record per physical component: identity, type,
-    bound MAT, active governing reading, superseded lineage, historical
-    lineage, and the verified calculation (taken from evaluate(), i.e. computed
-    only after reconciliation)."""
+def _fmt_matrix_value(row):
+    v_in = row.get("converted_in")
+    if v_in is None:
+        return f"{row.get('value')} {row.get('unit') or '(no unit)'}"
+    if row.get("unit") == "mm":
+        return f"{row['value']:g} mm ({v_in:.4f} in)"
+    return f"{v_in:.4f} in"
+
+
+def build_location_matrix(comp, lowest):
+    """One row per location reading with its status: ACTIVE_CURRENT, GOVERNING_MINIMUM,
+    SUPERSEDED_BY_ADDENDUM (with the addendum value/source), PAD_NON_PRESSURE_RETAINING or
+    UNIT_REVIEW_EXCLUDED. Nothing evaluated is ever left out of this matrix."""
+    rows = []
+
+    def base_row(r, status):
+        return {"location": r.get("location_label"), "value": r.get("value_raw"), "unit": r.get("unit_stated"),
+                "converted_in": round(r["value_in"], 5) if r.get("value_in") is not None else None,
+                "converted_mm": round(r["value_mm"], 3) if r.get("value_mm") is not None else None,
+                "status": status, "source_document": r.get("source_document")}
+
+    for r in comp.get("ut_thickness_measurements") or []:
+        rows.append(base_row(r, "GOVERNING_MINIMUM" if (lowest is not None and r is lowest) else "ACTIVE_CURRENT"))
+    for r in comp.get("non_pressure_boundary_measurements") or []:
+        rows.append(base_row(r, "PAD_NON_PRESSURE_RETAINING"))
+    for rec in comp.get("superseded_readings") or []:
+        row = {"location": rec.get("location_label"), "value": rec.get("value"), "unit": rec.get("unit"),
+               "converted_in": round(rec["value_in"], 5) if rec.get("value_in") is not None else None,
+               "converted_mm": rec.get("value_mm"), "status": "SUPERSEDED_BY_ADDENDUM",
+               "source_document": rec.get("source_document")}
+        sb = rec.get("superseded_by") or []
+        if sb:
+            best = min(sb, key=lambda x: x.get("value_in") if x.get("value_in") is not None else 1e9)
+            row.update({"addendum_value": best.get("value"), "addendum_unit": best.get("unit"),
+                        "addendum_value_in": round(best["value_in"], 5) if best.get("value_in") is not None else None,
+                        "addendum_source": best.get("source")})
+        rows.append(row)
+    for rec in comp.get("unit_review_readings") or []:
+        rows.append({"location": rec.get("location_label"), "value": rec.get("value"), "unit": rec.get("unit"),
+                     "converted_in": None, "converted_mm": None, "status": "UNIT_REVIEW_EXCLUDED",
+                     "source_document": rec.get("source_document")})
+    rows.sort(key=lambda x: (_natural_key(x.get("location")), x["status"]))
+    return rows
+
+
+def build_reading_provenance(matrix, mat_in):
+    """'Why NOT chosen' trail: the full array of evaluated readings, the selected governing
+    minimum, and an explicit exclusion / non-governing reason for every other reading."""
+    active = [r for r in matrix if r["status"] in ("ACTIVE_CURRENT", "GOVERNING_MINIMUM")]
+    gov = next((r for r in matrix if r["status"] == "GOVERNING_MINIMUM"), None)
+    evaluated = [r["location"] for r in active]
+    why = []
+    for r in matrix:
+        st_ = r["status"]
+        if st_ == "GOVERNING_MINIMUM":
+            continue
+        if st_ == "ACTIVE_CURRENT" and gov is not None:
+            diff = r["converted_in"] - gov["converted_in"]
+            rel = "higher than" if diff > 0 else "equal to"
+            why.append(f"{r['location']} ({_fmt_matrix_value(r)}) evaluated but {rel} governing minimum "
+                       f"{gov['location']} ({gov['converted_in']:.4f} in)" + (f" by {diff:.4f} in." if diff > 0 else "."))
+        elif st_ == "SUPERSEDED_BY_ADDENDUM":
+            add = (f"{r.get('addendum_value'):g} {r.get('addendum_unit')} ({r.get('addendum_value_in'):.4f} in)"
+                   if r.get("addendum_value") is not None and r.get("addendum_value_in") is not None else "a newer value")
+            why.append(f"{r['location']} prior reading ({_fmt_matrix_value(r)}) superseded by "
+                       f"{r.get('addendum_source') or 'signed addendum'} value {add} — supersession applies to this "
+                       "location ONLY; it was replaced, not evaluated as active.")
+        elif st_ == "PAD_NON_PRESSURE_RETAINING":
+            why.append(f"{r['location']} ({_fmt_matrix_value(r)}) is a repair-pad/reinforcement reading — "
+                       "non-pressure-retaining, excluded from the base-metal minimum.")
+        elif st_ == "UNIT_REVIEW_EXCLUDED":
+            why.append(f"{r['location']} ({_fmt_matrix_value(r)}) excluded pending unit review — no trustworthy "
+                       "inch value could be derived.")
+    superseded_locs = [r["location"] for r in matrix if r["status"] == "SUPERSEDED_BY_ADDENDUM"]
+    if gov is not None:
+        summary = (f"Evaluated {len(evaluated)} active location(s) ({', '.join(evaluated)}). "
+                   f"{gov['location']} ({gov['converted_in']:.4f} in) identified as the governing minimum.")
+        if superseded_locs:
+            summary += f" {', '.join(superseded_locs)} superseded by addendum (location-level only)."
+        summary += " Remaining locations remain active."
+    else:
+        summary = "No governing minimum could be selected from the active readings."
+    selected = ({"location": gov["location"], "value_in": gov["converted_in"], "value": gov["value"],
+                 "unit": gov["unit"]} if gov is not None else None)
+    return {"readings_evaluated": evaluated, "selected_governing_reading": selected,
+            "why_not_chosen": why, "provenance_summary": summary}
+
+
+def build_master_records(components, results, reconciliation=None):
+    """One consolidated master record per physical component: identity, type, bound MAT,
+    full location-readings matrix, extraction reconciliation, governing reading, superseded
+    lineage, historical lineage, and the verified calculation (taken from evaluate(), i.e.
+    computed only after reconciliation)."""
     records = []
-    for comp, res in zip(components, results):
+    per_comp = (reconciliation or {}).get("per_component") or []
+    for idx, (comp, res) in enumerate(zip(components, results)):
         lowest = res.get("lowest")
         active = comp.get("ut_thickness_measurements") or []
-        gdoc = comp.get("governing_document") or {}
         summary = res.get("evaluation_summary") or {}
         workflow = summary.get("workflow_status")
         corrected = bool(comp.get("correction_notes"))
-        if res["status"] in ("blocked",):
-            pass_fail, validity = "FAIL", "FAILED_BELOW_MAT"
-        elif workflow == "CLEARED":
-            pass_fail, validity = "PASS", ("VERIFIED_WITH_UNIT_CORRECTION" if corrected else "VERIFIED_SECURE")
+        if res["status"] == "incomplete_extraction":
+            pass_fail, validity, wf_label = "WITHHELD", "INCOMPLETE_EXTRACTION", INCOMPLETE_STATUS
+        elif res["status"] in ("blocked",):
+            pass_fail, validity, wf_label = "FAIL", "FAILED_BELOW_MAT", workflow
+        elif workflow == "READINGS PROCESS COMPLETE":
+            pass_fail = "PASS"
+            validity = "DATA_WORKFLOW_VERIFIED_WITH_UNIT_CORRECTION" if corrected else "DATA_WORKFLOW_VERIFIED"
+            wf_label = "DATA WORKFLOW VERIFIED"
         elif comp.get("unit_review_readings") and not active:
-            pass_fail, validity = "REVIEW", "UNIT_REVIEW_REQUIRED"
+            pass_fail, validity, wf_label = "REVIEW", "UNIT_REVIEW_REQUIRED", workflow
         elif res["status"] in ("insufficient", "no_measurements", "no_criteria_no_measurements"):
-            pass_fail, validity = "INSUFFICIENT_DATA", "INSUFFICIENT_DATA"
+            pass_fail, validity, wf_label = "INSUFFICIENT_DATA", "INSUFFICIENT_DATA", workflow
         else:
-            pass_fail, validity = "REVIEW", "REQUIRES_REVIEW"
+            pass_fail, validity, wf_label = "REVIEW", "REQUIRES_REVIEW", workflow
 
         active_reading = None
         if active:
@@ -2150,31 +2391,44 @@ def build_master_records(components, results):
                 "selected_governing_value_mm": lowest.get("value_mm") if lowest else None,
                 "selected_governing_value_in": round(lowest["value_in"], 5) if lowest else None,
                 "unit": lowest.get("unit_stated") if lowest else None,
-                "source_document": gdoc.get("source_document"),
-                "document_date": gdoc.get("document_date"),
-                "document_type": gdoc.get("document_type"),
-                "is_signed_addendum": gdoc.get("tier") == 2,
-                "is_superseding": bool(comp.get("superseded_readings")) and gdoc.get("tier") == 2,
+                "source_document": lowest.get("source_document") if lowest else None,
+                "document_date": lowest.get("document_date") if lowest else None,
+                "document_type": lowest.get("document_type") if lowest else None,
+                "is_signed_addendum": bool(lowest.get("is_signed_addendum")) if lowest else False,
+                "is_superseding": bool(lowest.get("is_signed_addendum")) and bool(comp.get("superseded_readings")) if lowest else False,
             }
         mat = res.get("mat")
         margin = res.get("margin")
+        matrix = build_location_matrix(comp, lowest)
+        prov = build_reading_provenance(matrix, mat)
+        rc = per_comp[idx] if idx < len(per_comp) else {
+            "total_raw_decimals_found": 0, "total_readings_mapped": 0, "unmapped_count": 0,
+            "completeness_status": "NOT AUDITED"}
         records.append({
             "component_identifier": comp.get("component_identifier") or comp.get("component_name"),
             "component_name": comp.get("component_name"),
             "component_type": comp.get("component_type"),
             "governing_mat": {"value": round(mat, 5), "unit": "in"} if mat is not None else None,
             "mat_binding": comp.get("mat_binding"),
+            "extraction_reconciliation": rc,
+            "location_readings_matrix": matrix,
             "active_governing_reading": active_reading,
             "attached_reinforcement": comp.get("attached_reinforcement"),
             "superseded_readings": comp.get("superseded_readings") or [],
+            "precedence_audit": comp.get("precedence_notes") or [],
             "historical_lineage": comp.get("historical_lineage") or [],
             "unit_review_readings": comp.get("unit_review_readings") or [],
+            "reading_provenance": prov,
             "engineering_calculations": {
+                "selected_governing_reading": ({"location": lowest.get("location_label"),
+                                                "value_in": round(lowest["value_in"], 5)} if lowest else None),
                 "lowest_active_reading_in": round(lowest["value_in"], 5) if lowest else None,
                 "governing_mat_in": round(mat, 5) if mat is not None else None,
                 "true_margin_in": round(margin, 5) if margin is not None else None,
+                "workflow_status": wf_label,
                 "pass_fail_status": pass_fail,
                 "calculation_validity": validity,
+                "provenance_summary": prov["provenance_summary"],
             },
         })
     return records
@@ -2272,7 +2526,7 @@ def build_evaluation_summary(status, name, lowest=None, mat=None, mat_unit=None,
     same conservative handling: a BLOCKED result stays BLOCKED (a fail is
     never softened just because the read is lower-confidence), but a
     passing result is downgraded to NEEDS_HUMAN_REVIEW rather than
-    confidently CLEARED, since a false "pass" from an unverified or
+    confidently READINGS PROCESS COMPLETE, since a false "pass" from an unverified or
     low-confidence read is the more dangerous failure mode to risk."""
     unconfirmed = via_fallback or low_confidence
     if status == "blocked":
@@ -2330,18 +2584,28 @@ def build_evaluation_summary(status, name, lowest=None, mat=None, mat_unit=None,
                 f"Mathematical result is WITHIN_SPEC ({name} measured {lowest['value']:.4f}{unit} vs. "
                 f"{mat:.4f}{unit} required minimum, margin {margin:+.4f}), but this reading "
                 f"{' and '.join(cause)}. System workflow set to NEEDS_HUMAN_REVIEW rather than "
-                f"CLEARED — a passing margin from a lower-confidence read is not treated as a "
+                f"READINGS PROCESS COMPLETE — a passing margin from a lower-confidence read is not treated as a "
                 f"definitive pass."
             )
             risk_category = "REQUIRES_VERIFICATION"
         else:
             calculation_result = "WITHIN_SPEC"
-            workflow_status = "CLEARED"
+            workflow_status = "READINGS PROCESS COMPLETE"
             status_explanation = (
                 f"Mathematical result is WITHIN_SPEC ({name} measured {lowest['value']:.4f}{unit} vs. "
-                f"{mat:.4f}{unit} required minimum, margin {margin:+.4f}). System workflow set to CLEARED."
+                f"{mat:.4f}{unit} required minimum, margin {margin:+.4f}). System workflow set to READINGS PROCESS COMPLETE."
             )
             risk_category = None
+    elif status == "incomplete_extraction":
+        calculation_result = "WITHHELD_INCOMPLETE_EXTRACTION"
+        workflow_status = INCOMPLETE_STATUS
+        status_explanation = (
+            f"{name}: pass/fail margin calculation WITHHELD. The extraction completeness audit found location "
+            "decimal readings in the raw report that were never mapped into a component, so the true minimum "
+            "cannot be trusted (a dropped low reading would make the computed minimum look better than it is). "
+            "Manual confirmation is required before any margin is shown."
+        )
+        risk_category = "REQUIRES_VERIFICATION"
     else:  # insufficient / no_measurements / no_criteria_no_measurements
         calculation_result = "INSUFFICIENT_DATA"
         workflow_status = "NEEDS_HUMAN_REVIEW"
@@ -2359,7 +2623,7 @@ def build_evaluation_summary(status, name, lowest=None, mat=None, mat_unit=None,
     }
 
 
-def evaluate_component(component, is_piping, piping_vars):
+def evaluate_component(component, is_piping, piping_vars, block_margins=False):
     """is_piping gates the B31.3 fallback so it never fires for structural steel
     or other non-pressurized assets."""
     name = component.get("component_name") or "Unnamed Component"
@@ -2370,6 +2634,14 @@ def evaluate_component(component, is_piping, piping_vars):
     degradation = compute_degradation(component)
     mat_provenance = component.get("mat_provenance")
     ut_provenance = component.get("ut_provenance")
+
+    if block_margins:
+        # Hard stop: no minimum, margin, or pass/fail is computed from a possibly-incomplete reading set.
+        evaluation_summary = build_evaluation_summary("incomplete_extraction", name, mat=mat, mat_unit=mat_unit)
+        return {"name": name, "status": "incomplete_extraction", "mat": mat, "mat_unit": mat_unit,
+                 "ut_measurements": ut_list, "mat_provenance": mat_provenance,
+                 "ut_provenance": ut_provenance, "degradation": None,
+                 "evaluation_summary": evaluation_summary, "raw": component}
 
     if not ut_list and component.get("unit_review_readings"):
         missing = ["Verified unit for reading(s): " + ", ".join(
@@ -2578,6 +2850,11 @@ def build_risk_ledger(results, field_anomalies, pressure_excursions, ledger_item
                 )
         elif r["status"] == "requires_verification_prep":
             entries["REQUIRES_VERIFICATION"].append(r["evaluation_summary"]["status_explanation"])
+        elif r["status"] == "incomplete_extraction":
+            entries["REQUIRES_VERIFICATION"].append(
+                f"{r['name']}: margin calculation withheld — location readings found in the raw report were not "
+                "mapped into this component (incomplete extraction)."
+            )
         elif cat == "MISSING_INFORMATION":
             if r["status"] == "no_criteria_no_measurements":
                 entries[cat].append(f"{r['name']}: no design acceptance criteria or wall-thickness examination metrics provided")
@@ -2633,21 +2910,38 @@ def build_risk_ledger(results, field_anomalies, pressure_excursions, ledger_item
     return entries
 
 
-def evaluate(extracted):
+def evaluate(extracted, reconciliation=None, confirmed=False):
     components = extracted.get("components_matrix") or []
     asset_category = (extracted.get("asset_category") or "").lower()
     is_piping = "pip" in asset_category  # covers "piping" / "pipeline" / "process pipe"
     piping_vars = extracted.get("piping_design_variables")
 
-    results = [evaluate_component(c, is_piping, piping_vars) for c in components]
+    recon = reconciliation or {}
+    extraction_incomplete = bool(recon.get("requires_confirmation")) and not confirmed
+    blocked_idx = set(recon.get("blocked_component_indexes") or [])
+    results = [
+        evaluate_component(c, is_piping, piping_vars,
+                           block_margins=extraction_incomplete and (bool(recon.get("global_blocked")) or i in blocked_idx))
+        for i, c in enumerate(components)
+    ]
     blocked = [r for r in results if r["status"] == "blocked"]
-    unresolved = [r for r in results if r["status"] in ("insufficient", "no_measurements", "no_criteria_no_measurements", "requires_verification_prep")]
+    unresolved = [r for r in results if r["status"] in ("insufficient", "no_measurements", "no_criteria_no_measurements", "requires_verification_prep", "incomplete_extraction")]
     degradations = [r["degradation"] for r in results if r.get("degradation") and r["degradation"]["is_loss"]]
     field_anomalies = extracted.get("field_anomalies") or []
     ledger_items = extracted.get("missing_engineering_variables_ledger") or []
     pressure_excursions = evaluate_pressure_events(extracted.get("pressure_events"))
 
     risk_ledger = build_risk_ledger(results, field_anomalies, pressure_excursions, ledger_items)
+    if extraction_incomplete:
+        risk_ledger["REQUIRES_VERIFICATION"].insert(0, (
+            f"Extraction completeness: {recon.get('mapped')} of {recon.get('expected')} location decimal readings "
+            f"found in the raw text were mapped into components ({recon.get('completeness_pct', 0):.1f}%). "
+            "Pass/fail margin calculations are withheld until the user confirms."))
+    elif recon.get("requires_confirmation") and confirmed:
+        risk_ledger["REQUIRES_VERIFICATION"].append(
+            f"Extraction completeness gate manually confirmed by the user "
+            f"({recon.get('mapped')} of {recon.get('expected')} location decimals mapped; "
+            f"{recon.get('unmapped_count')} unmapped reading(s) reviewed against the source report).")
     for c in components:
         nm = c.get("component_name") or "Unnamed Component"
         for msg in c.get("review_notes") or []:
@@ -2657,16 +2951,18 @@ def evaluate(extracted):
     has_fail = bool(risk_ledger["FAIL_BELOW_CRITERION"])
     has_other_open_risk = any(risk_ledger[t] for t in ("CONFLICT", "MISSING_INFORMATION", "REQUIRES_VERIFICATION"))
 
-    if not results and not any(risk_ledger.values()):
+    if extraction_incomplete:
+        global_status = INCOMPLETE_STATUS
+    elif not results and not any(risk_ledger.values()):
         global_status = "CONDITION UNVERIFIED"
     elif has_fail:
         global_status = "BLOCKED"
     elif has_other_open_risk:
         global_status = "CONDITION UNVERIFIED"
     else:
-        global_status = "VERIFIED SECURE"
+        global_status = "DATA WORKFLOW VERIFIED"
 
-    ledger_message = build_status_ledger_message(global_status, risk_ledger)
+    ledger_message = build_status_ledger_message(global_status, risk_ledger, recon)
 
     raw_confidence = extracted.get("confidence_metrics") or {}
     confidence_metrics = {
@@ -2685,18 +2981,28 @@ def evaluate(extracted):
              "pressure_excursions": pressure_excursions, "risk_ledger": risk_ledger,
              "global_status": global_status, "ledger_message": ledger_message,
              "confidence_metrics": confidence_metrics,
-             "master_records": build_master_records(components, results)}
+             "master_records": build_master_records(components, results, reconciliation),
+             "reconciliation": reconciliation, "gate_confirmed": confirmed}
 
 
-def build_status_ledger_message(global_status, risk_ledger):
+def build_status_ledger_message(global_status, risk_ledger, reconciliation=None):
     """Builds a context-specific diagnostic sentence naming the exact
     parameters driving the restriction, drawn from the tiered risk ledger,
     instead of a bare status word — and explicitly notes that the workflow
     label is a policy decision, not an independent engineering determination
     (requirement: decouple workflow status from mathematical results)."""
-    if global_status == "VERIFIED SECURE":
-        return ("VERIFIED SECURE: All mapped components carry a stated criteria set and a current "
-                "reading at or above minimum. No confirmed exceedances or open risk items on file.")
+    if global_status == INCOMPLETE_STATUS:
+        rc = reconciliation or {}
+        return (f"{INCOMPLETE_STATUS}: only {rc.get('mapped')} of {rc.get('expected')} location decimal readings "
+                f"found in the raw text ({rc.get('completeness_pct', 0):.1f}%) were mapped into components, "
+                "so pass/fail margin calculations are withheld. Review the unmapped readings and confirm below "
+                "(or fix the extraction) before any margin is shown. This is a data-processing status, not an "
+                "engineering determination.")
+
+    if global_status == "DATA WORKFLOW VERIFIED":
+        return ("DATA WORKFLOW VERIFIED: All mapped components carry a stated criteria set and a current "
+                "reading at or above minimum. No confirmed exceedances or open risk items on file. "
+                "(Data-processing result only — not a certification of physical equipment safety.)")
 
     fails = risk_ledger.get("FAIL_BELOW_CRITERION", [])
     other_entries = []
@@ -2758,17 +3064,181 @@ def remediation_steps(component_name):
 # effort, not a guarantee — plus flat-manifest-specific parse notices)
 # ============================================================================
 
-def audit_extraction(report_text, extracted, parse_notices):
+EXTRACTION_COMPLETENESS_THRESHOLD = 0.95
+INCOMPLETE_STATUS = "REQUIRES VERIFICATION — INCOMPLETE EXTRACTION"
+_EQUIV_TOLERANCE = 0.0015  # dual-unit rows: 0.478 in vs 12.14 mm agree to ~0.01%; 3-dp rounding <= ~0.1%
+
+# Letter prefixes that look like a location label but are document/standard identifiers.
+_NOT_A_LOCATION_PREFIXES = {"ADD", "REV", "UT", "ID", "NO", "PT", "MT", "RT", "VT", "API", "ASME", "AWS", "SEC",
+                            "FIG", "TBL", "PG", "PSI", "MM", "IN", "DOC", "RPT", "ISO", "AST", "ANS"}
+_LOC_LABEL_RE = re.compile(r"(?<![A-Za-z0-9.\-])([A-Z]{1,3})-?(\d{1,2})(?:-([A-Z0-9]{1,2}))?(?![A-Za-z0-9]|\.\d)")
+_DECIMAL_TOKEN_RE = re.compile(r"(?<![\w.])(\d+\.\d+)(?!\d|\.\d)")
+
+
+def _pool_key(v):
+    try:
+        return round(float(v), 6)
+    except (TypeError, ValueError):
+        return None
+
+
+def _label_prefix(key):
+    m = re.match(r"[a-z]+", key or "")
+    return m.group(0) if m else ""
+
+
+def compute_extraction_reconciliation(report_text, components, extracted):
+    """Hard extraction-completeness audit (plain Python, independent of the model).
+
+    Finds every decimal token printed on a LOCATION line of the RAW report (a line containing a
+    location identifier such as S03 or N2-C) and matches each one against the readings that were
+    actually mapped into component arrays (current, historical, superseded, pad, unit-review, and
+    stated MAT/pad values). An unmatched token is an UNMAPPED reading.
+
+      completeness = mapped / expected
+
+    Hard-stop rule: completeness < 95% globally forces INCOMPLETE EXTRACTION. Stricter component
+    rule: ANY unmapped reading attributable to a component also withholds that component, because
+    one dropped low reading (e.g. S03 = 11.96 mm) can flip a minimum even at 98% overall.
+    A decimal that is just the other-unit print of an already-mapped reading on the SAME line
+    (e.g. '12.14 mm / 0.478 in') is treated as mapped."""
+    global_pool = Counter()
+    comp_keys, comp_prefixes = [], {}
+    for i, c in enumerate(components):
+        keys = set()
+        for e in c.get("extraction_ledger") or []:
+            pk = _pool_key(e.get("raw_value"))
+            if pk is not None:
+                global_pool[pk] += 1
+            k = _location_key(e.get("location_label"))
+            if not _is_auto_location(k):
+                keys.add(k)
+        for v in c.get("extra_raw_tokens") or []:
+            pk = _pool_key(v)
+            if pk is not None:
+                global_pool[pk] += 1
+        for nm in (c.get("component_identifier"), c.get("component_name")):
+            k = _location_key(nm)
+            if k and re.fullmatch(r"[a-z]{1,3}\d{1,2}[a-z0-9]?", k):
+                keys.add(k)
+        comp_keys.append(keys)
+        for k in keys:
+            pref = _label_prefix(k)
+            if pref:
+                comp_prefixes.setdefault(pref, set()).add(i)
+    gm = (extracted or {}).get("global_minimum_allowable_thickness") or {}
+    for v in [gm.get("value")] + [row.get("value") for row in (extracted or {}).get("component_mat_table") or []] \
+            + list(((extracted or {}).get("piping_design_variables") or {}).values()):
+        pk = _pool_key(v)
+        if pk is not None:
+            global_pool[pk] += 1
+
+    tokens = []
+    for ln, line in enumerate((report_text or "").splitlines(), start=1):
+        labels = [m.group(0) for m in _LOC_LABEL_RE.finditer(line)
+                  if m.group(1) not in _NOT_A_LOCATION_PREFIXES]
+        if not labels:
+            continue
+        decs = _DECIMAL_TOKEN_RE.findall(line)
+        if not decs:
+            continue
+        line_keys = {_location_key(l) for l in labels}
+        owner = next((i for i, keys in enumerate(comp_keys) if keys & line_keys), None)
+        if owner is None:
+            cands = set()
+            for lk in line_keys:
+                cands |= comp_prefixes.get(_label_prefix(lk), set())
+            if len(cands) == 1:
+                owner = next(iter(cands))
+        for d in decs:
+            tokens.append({"value": float(d), "text": d, "line_no": ln, "line": line.strip()[:200], "owner": owner,
+                           "matched": False})
+
+    pool = Counter(global_pool)
+    for t in tokens:                       # pass 1: exact value match
+        pk = _pool_key(t["value"])
+        if pool[pk] > 0:
+            pool[pk] -= 1
+            t["matched"] = True
+    by_line = {}
+    for t in tokens:
+        if t["matched"]:
+            by_line.setdefault(t["line_no"], []).append(t["value"])
+    for t in tokens:                       # pass 2: other-unit print of a reading matched on the same line
+        if t["matched"]:
+            continue
+        for m in by_line.get(t["line_no"], []):
+            if m and (abs(t["value"] * MM_PER_IN - m) / m <= _EQUIV_TOLERANCE
+                      or abs(t["value"] / MM_PER_IN - m) / m <= _EQUIV_TOLERANCE):
+                t["matched"] = True
+                break
+
+    def bucket():
+        return {"expected": 0, "mapped": 0, "unmapped": []}
+
+    per = [bucket() for _ in components]
+    unattributed = bucket()
+    unmapped_tokens = []
+    for t in tokens:
+        b = per[t["owner"]] if t["owner"] is not None else unattributed
+        b["expected"] += 1
+        if t["matched"]:
+            b["mapped"] += 1
+        else:
+            rec = {"value": t["text"], "line_no": t["line_no"], "line": t["line"],
+                   "component": components[t["owner"]].get("component_name") if t["owner"] is not None else None}
+            b["unmapped"].append(rec)
+            unmapped_tokens.append(rec)
+
+    per_component, blocked_idx = [], []
+    for i, b in enumerate(per):
+        exp, mp = b["expected"], b["mapped"]
+        pct = 100.0 if exp == 0 else mp / exp * 100
+        if exp == 0:
+            status = "NO ATTRIBUTABLE RAW DECIMALS FOUND"
+        elif b["unmapped"]:
+            status = f"{pct:.1f}% — INCOMPLETE ({len(b['unmapped'])} unmapped)"
+            blocked_idx.append(i)
+        else:
+            status = "100% COMPLETE"
+        per_component.append({
+            "total_raw_decimals_found": exp, "total_readings_mapped": mp, "unmapped_count": exp - mp,
+            "completeness_status": status, "unmapped_values": [u["value"] for u in b["unmapped"]],
+            "readings_extracted_for_component": len(components[i].get("extraction_ledger") or []),
+        })
+
+    expected, mapped = len(tokens), sum(1 for t in tokens if t["matched"])
+    pct = 100.0 if expected == 0 else mapped / expected * 100
+    global_blocked = expected > 0 and (mapped / expected) < EXTRACTION_COMPLETENESS_THRESHOLD
+    return {
+        "expected": expected, "mapped": mapped, "unmapped_count": expected - mapped, "completeness_pct": pct,
+        "threshold_pct": EXTRACTION_COMPLETENESS_THRESHOLD * 100,
+        "global_blocked": global_blocked, "blocked_component_indexes": blocked_idx,
+        "requires_confirmation": global_blocked or bool(blocked_idx),
+        "per_component": per_component,
+        "unattributed": {"total_raw_decimals_found": unattributed["expected"],
+                         "total_readings_mapped": unattributed["mapped"],
+                         "unmapped_count": len(unattributed["unmapped"])},
+        "unmapped_tokens": unmapped_tokens,
+    }
+
+
+def audit_extraction(report_text, extracted, parse_notices, reconciliation=None):
     notices = list(parse_notices)
     components = extracted.get("components_matrix") or []
 
-    numeric_tokens = re.findall(r"\b\d+\.\d+\b", report_text)
-    total_readings = sum(len(c.get("ut_thickness_measurements") or []) for c in components)
-    if numeric_tokens and total_readings < max(1, int(len(numeric_tokens) * 0.5)):
+    rc = reconciliation
+    if rc and rc["unmapped_count"] > 0:
         notices.append(
-            f"The source text contains {len(numeric_tokens)} decimal values, but only "
-            f"{total_readings} were mapped into components — some readings may not have been assigned."
+            f"HARD WARNING — EXTRACTION COMPLETENESS: {rc['mapped']} of {rc['expected']} location decimal readings "
+            f"found in the raw text were mapped into components ({rc['completeness_pct']:.1f}%). "
+            f"{rc['unmapped_count']} reading(s) are unmapped — a dropped reading can hide the true minimum."
         )
+        for u in rc["unmapped_tokens"][:30]:
+            where = f" (nearest component: {u['component']})" if u.get("component") else ""
+            notices.append(f"HARD WARNING — unmapped reading {u['value']} on source line {u['line_no']}{where}: \"{u['line']}\"")
+        if len(rc["unmapped_tokens"]) > 30:
+            notices.append(f"HARD WARNING — {len(rc['unmapped_tokens']) - 30} further unmapped reading(s) not listed.")
 
     keywords = ["column", "plate", "gusset", "flange", "shell", "head", "nozzle", "beam", "brace", "support", "tube", "coil", "skirt"]
     text_lower = report_text.lower()
@@ -2823,6 +3293,87 @@ components.html(
     """,
     height=0,
 )
+
+
+LEGAL_DISCLAIMER = (
+    "Notice: This system verifies data ingestion, extraction completeness, and mathematical calculations only. "
+    "It does NOT issue an independent engineering sign-off or certify physical equipment safety. "
+    "Final disposition rests solely with the certified Authorized Inspector (AI)."
+)
+
+
+def render_legal_banner(footer=False):
+    st.markdown(f"<div class='legal-banner'><b>Notice:</b> {LEGAL_DISCLAIMER[len('Notice: '):]}</div>",
+                unsafe_allow_html=True)
+
+
+def render_reconciliation_summary(recon):
+    accent = "accent-gold" if recon["requires_confirmation"] else "accent-cyan"
+    st.markdown(
+        metric_html("Extraction Completeness (location decimals mapped / found in raw text)",
+                    f"{recon['mapped']} / {recon['expected']} ({recon['completeness_pct']:.1f}%)", accent),
+        unsafe_allow_html=True,
+    )
+
+
+def render_incomplete_extraction_gate(recon, cache_key):
+    """Hard stop UI: lists every unmapped reading and returns True only after the user ticks the
+    manual-confirmation box. Until then evaluate() withholds all affected margin calculations."""
+    st.markdown(
+        f"<div class='status-ledger-banner blocked'><b>{INCOMPLETE_STATUS}</b><br>"
+        f"{recon['mapped']} of {recon['expected']} location decimal readings found in the raw text "
+        f"({recon['completeness_pct']:.1f}%) were mapped into components "
+        f"(hard-stop threshold: {recon['threshold_pct']:.0f}% globally, and no unmapped reading may be attributable "
+        "to a component). Pass/fail margin calculations are blocked until this is manually confirmed.</div>",
+        unsafe_allow_html=True,
+    )
+    rows = [{"Value": u["value"], "Source line": u["line_no"], "Nearest component": u.get("component") or "—",
+             "Raw text": u["line"]} for u in recon["unmapped_tokens"]]
+    with st.expander("Unmapped location decimals (source-line evidence)", expanded=True):
+        if rows:
+            st.dataframe(rows, hide_index=True)
+        else:
+            st.write("Global completeness is below threshold, but no individual unmapped token could be listed.")
+    return st.checkbox(
+        "I have manually reviewed the unmapped readings above against the source report and confirm none of them is "
+        "a governing location reading that was omitted (or I have accepted the risk of proceeding).",
+        key=f"confirm_incomplete_{cache_key}",
+    )
+
+
+def render_location_provenance(rec):
+    """Location readings matrix + 'why NOT chosen' trail for one component's master record."""
+    if not rec or not rec.get("location_readings_matrix"):
+        return
+    prov = rec.get("reading_provenance") or {}
+    rc = rec.get("extraction_reconciliation") or {}
+    with st.expander("Location Readings Evaluated & Why NOT Chosen"):
+        st.markdown(
+            f"**Extraction reconciliation:** {rc.get('total_readings_mapped', 0)} of "
+            f"{rc.get('total_raw_decimals_found', 0)} raw decimals mapped — {rc.get('completeness_status', 'n/a')}"
+        )
+        rows = []
+        for r in rec["location_readings_matrix"]:
+            rows.append({
+                "Location": r.get("location"),
+                "Reported": f"{r.get('value')} {r.get('unit') or ''}".strip(),
+                "Converted (in)": f"{r['converted_in']:.4f}" if r.get("converted_in") is not None else "—",
+                "Status": r.get("status"),
+                "Addendum value": (f"{r['addendum_value']} {r.get('addendum_unit') or ''} ({r.get('addendum_source')})"
+                                    if r.get("addendum_value") is not None else ""),
+            })
+        st.dataframe(rows, hide_index=True)
+        st.markdown(f"**Readings evaluated (active):** {', '.join(prov.get('readings_evaluated') or []) or 'none'}")
+        sel = prov.get("selected_governing_reading")
+        if sel:
+            st.markdown(f"**Selected governing minimum:** {sel['location']} = {sel['value']:g} {sel['unit']} "
+                        f"({sel['value_in']:.4f} in)")
+        for line in prov.get("why_not_chosen") or []:
+            st.markdown(f"- {line}")
+        for line in rec.get("precedence_audit") or []:
+            st.markdown(f"- **Precedence audit:** {line}")
+        if prov.get("provenance_summary"):
+            st.caption(prov["provenance_summary"])
 
 
 def metric_html(label, value, accent=None):
@@ -2917,7 +3468,7 @@ def render_degradation_card(deg):
 
 def render_status_ledger_banner(outcome):
     gs = outcome["global_status"]
-    css_class = "blocked" if gs == "BLOCKED" else ("secure" if gs == "VERIFIED SECURE" else "unverified")
+    css_class = "blocked" if gs in ("BLOCKED", INCOMPLETE_STATUS) else ("secure" if gs == "DATA WORKFLOW VERIFIED" else "unverified")
     st.markdown(
         f"<div class='status-ledger-banner {css_class}'><b>{outcome['ledger_message']}</b></div>",
         unsafe_allow_html=True,
@@ -2996,7 +3547,7 @@ def _mat_binding_text(result):
     return f"{mb.get('component_type', '?')} → {mb.get('source', 'n/a')}"
 
 
-def render_component_card(result, extracted):
+def render_component_card(result, extracted, master_record=None):
     status = result["status"]
     via_fallback = bool(result.get("via_fallback"))
     low_confidence = bool(result.get("low_confidence"))
@@ -3011,7 +3562,8 @@ def render_component_card(result, extracted):
 
     pill_label = {
         "blocked": "Blocked",
-        "verified": "Pending Verification" if unconfirmed_downgrade else "Verified",
+        "verified": "Pending Verification" if unconfirmed_downgrade else "Data Workflow Verified",
+        "incomplete_extraction": "Incomplete Extraction — Withheld",
         "insufficient": "Unresolved",
         "no_measurements": "No Data",
         "no_criteria_no_measurements": "Unverified",
@@ -3120,6 +3672,14 @@ def render_component_card(result, extracted):
                 f"authorized.</div></div>",
                 unsafe_allow_html=True,
             )
+    elif status == "incomplete_extraction":
+        st.error(
+            "Margin calculation WITHHELD — the extraction completeness audit found location decimal readings in the "
+            "raw report that were not mapped into components. Confirm the completeness gate at the top of the page "
+            "(or fix the extraction) before any pass/fail margin is shown for this component."
+        )
+        next_steps = ["Review the unmapped readings listed in the completeness gate against the source report.",
+                      "Re-run the extraction or supply the missing location readings before disposition."]
     elif status == "insufficient":
         st.write("Cannot compute a margin for this component — missing:")
         for m in result["missing_vars"]:
@@ -3135,6 +3695,7 @@ def render_component_card(result, extracted):
         )
         next_steps = ["Establish a design acceptance criterion for this component with engineering.", "Schedule a wall-thickness examination (UT) once criteria are established."]
 
+    render_location_provenance(master_record)
     render_provenance_expander(result)
     render_audit_trail_expander(result, next_steps)
 
@@ -3143,6 +3704,8 @@ def render_component_card(result, extracted):
 
     st.markdown("</div>", unsafe_allow_html=True)
 
+
+render_legal_banner()
 
 client = get_client()
 if client is None:
@@ -3205,8 +3768,12 @@ if uploaded is not None:
 
     extracted = st.session_state["extracted"]
     parse_notices = st.session_state.get("parse_notices", [])
-    outcome = evaluate(extracted)
-    audit_notices = audit_extraction(report_text, extracted, parse_notices)
+    reconciliation = compute_extraction_reconciliation(report_text, extracted.get("components_matrix") or [], extracted)
+    gate_confirmed = False
+    if reconciliation["requires_confirmation"]:
+        gate_confirmed = render_incomplete_extraction_gate(reconciliation, cache_key)
+    outcome = evaluate(extracted, reconciliation, gate_confirmed)
+    audit_notices = audit_extraction(report_text, extracted, parse_notices, reconciliation)
     cm = outcome["confidence_metrics"]
 
     # Pressure-excursion alerts always sit at the very top of the matrix panel —
@@ -3215,7 +3782,7 @@ if uploaded is not None:
         if not pe["is_duplicate"] and pe["duration_status"] != "BELOW_THRESHOLD":
             render_pressure_alert_banner(pe)
 
-    st.markdown("#### Global Engineering Status Ledger")
+    st.markdown("#### Global Data Workflow Status Ledger")
     render_status_ledger_banner(outcome)
 
     st.markdown("#### 5-Tier Risk Taxonomy Ledger")
@@ -3228,16 +3795,20 @@ if uploaded is not None:
     m3.markdown(metric_html("Source Conflict Level", cm["source_conflict_level"]), unsafe_allow_html=True)
     m4.markdown(metric_html("Engineering Determination", cm["engineering_determination"]), unsafe_allow_html=True)
     st.caption("Engineering Determination is always NOT_AVAILABLE — this system extracts, calculates, and flags; it never issues an independent engineering sign-off.")
+    render_reconciliation_summary(reconciliation)
 
-    st.markdown("#### Global Engineering Safety Status")
+    st.markdown("#### Global Data Workflow Status")
     gs = outcome["global_status"]
-    gs_accent = "accent-gold" if gs == "BLOCKED" else None
+    gs_accent = "accent-gold" if gs in ("BLOCKED", INCOMPLETE_STATUS) else None
     st.markdown(metric_html("Workflow Status (system policy, not an engineering determination)", gs, gs_accent), unsafe_allow_html=True)
 
     if audit_notices:
         st.markdown("#### 🟡 System Extraction Audit Notice")
         for notice in audit_notices:
-            st.warning(notice)
+            if notice.startswith("HARD WARNING"):
+                st.error(notice)
+            else:
+                st.warning(notice)
 
     left, right = st.columns([1, 1])
 
@@ -3263,8 +3834,8 @@ if uploaded is not None:
 
         st.markdown("#### Calculation Trail Ledger")
         st.caption("Component Name → Measured Minimum UT → Required Minimum MAT → Computed True Margin → Calculation Result / Workflow Status → Potential Next Steps")
-        for result in outcome["results"]:
-            render_component_card(result, extracted)
+        for i, result in enumerate(outcome["results"]):
+            render_component_card(result, extracted, outcome["master_records"][i] if i < len(outcome["master_records"]) else None)
 
         render_master_records(outcome["master_records"])
 
@@ -3309,3 +3880,5 @@ if uploaded is not None:
 
 else:
     st.info("Upload a .txt inspection field log above to run extraction.")
+
+render_legal_banner(footer=True)
